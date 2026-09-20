@@ -30,7 +30,9 @@ Everything else in the repo is ordinary code and can be refactored freely.
   `const`. Most online examples are pre-0.30 and will not compile.
 - When unsure, read the pinned source under
   `~/.cargo/registry/src/*/ratatui-0.30.*` or `ratatui-core-*` / `ratatui-widgets-*`,
-  or docs.rs for the exact version.
+  or docs.rs for the exact version. The `ratatui-tui` skill in `.claude/skills/`
+  has 0.30 API notes and pattern references; its stack and styling defaults do
+  not apply here (see `CLAUDE.md`).
 - Colors: amber for key hints is `Color::Indexed(214)`, not RGB, so it renders
   without truecolor. Red-ish grades `LightRed`, green-ish `LightGreen`.
 - Render functions take `(&mut Frame, Rect, &App)` and return nothing. No widget

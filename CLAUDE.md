@@ -28,6 +28,17 @@ Read the following to get the full context of the project
 `ratatui::widgets`. Pre-0.30 examples online will not compile. When unsure, read
 the pinned crate source in `~/.cargo/registry/src/` rather than guessing.
 
+The project-scoped `ratatui-tui` skill (`.claude/skills/ratatui-tui/`, from
+blacktop/dotfiles) is the reference for 0.30 API notes, widget and layout
+patterns, async event handling (M1) and ratatui-image (later). Follow its API
+advice; ignore its stack and styling advice where it conflicts with this repo:
+
+- anyhow, not color-eyre; edition 2021, not 2024
+- no tokio, clap, tracing, textwrap or tui-shimmer until a milestone needs them
+- no blocks, borders, shadows or cyan palette — the three-row chromeless layout
+  and amber hints in `context/coding-standards.md` win
+- its project templates are for greenfield apps; grain already has its shape
+
 ## Commands
 
 ```bash
