@@ -1,0 +1,26 @@
+[package]
+name = "grain"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Terminal spaced-repetition and incremental-reading app over a markdown vault"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+crossterm = "0.29"
+ratatui = "0.30"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
