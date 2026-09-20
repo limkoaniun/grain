@@ -188,11 +188,11 @@ Boundaries that matter:
 Open a vault, index it, queue, review end to end, journal, undo, quit. 53 tests,
 clippy clean, acceptance checklist verified against the real binary in a pty.
 
-### M1 — SuperMemo sync · Spec drafted, see `features/m1-supermemo-sync-spec.md`
+### M1 — SuperMemo sync · Spec approved, see `features/m1-supermemo-sync-spec.md`
 After each journal commit, post the grade to `POST /algorithm/review`, store
 `interval_returned`, mark `synced = 1`, write `due`/`interval` back to the file.
 A worker thread does HTTP only; all writes stay on the UI thread. No schema or
-format change. Blocking client (ureq proposed), no tokio.
+format change. Blocking client (ureq), key from `GRAIN_SM_API_KEY`, no tokio.
 
 ### M2 — incremental reading · Not started
 Read screen for articles, `read_pos`, extract to card, priority modal.

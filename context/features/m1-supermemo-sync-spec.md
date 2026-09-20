@@ -1,7 +1,7 @@
 # grain M1 — SuperMemo sync
 
 Date: 2026-09-20
-Status: draft, awaiting review
+Status: approved 2026-09-20
 
 M1 makes the grades grain already journals reach the SuperMemo API, and brings the
 returned interval back into the vault. After M1, grading a card in grain moves its
@@ -63,8 +63,8 @@ server it is permanent. That single fact drives the undo design below.
 
 ## Decisions
 
-Settled while writing this spec; recorded so they are not relitigated. Items marked
-**ask** are the ones the user should confirm before `/feature start`.
+Settled while writing this spec and confirmed by the user on 2026-09-20; recorded
+so they are not relitigated.
 
 | Decision | Choice |
 |---|---|
@@ -72,11 +72,11 @@ Settled while writing this spec; recorded so they are not relitigated. Items mar
 | Schema | **No change.** `journal.synced` and `journal.interval_returned` already exist. New `meta` keys only. |
 | File format | **No change.** `due` and `interval` are already defined keys; M1 starts writing them. |
 | Who writes | All SQLite writes and all vault-file writes stay on the UI thread. The worker thread only does HTTP. |
-| HTTP client | **ask** — `ureq` 3 with rustls (blocking, no tokio, small) rather than `reqwest`. reqwest's blocking mode spins up a tokio runtime internally, which the M0 brief listed as deliberately absent. |
+| HTTP client | `ureq` 3 with rustls (blocking, no tokio, small) rather than `reqwest`. reqwest's blocking mode spins up a tokio runtime internally, which the M0 brief listed as deliberately absent. |
 | Undo vs. server | A grade can be undone only while it is unsent. Sending is delayed by a grace period so undo has its window. Once sent, undo is refused with a reason. |
 | Grace period | 5 seconds after grading, or immediately on quit. `meta.sync_grace_secs` overrides. |
 | Identity | `ext_learner_id` and `ext_collection_id` come from `meta` (`sm_learner_id`, `sm_collection_id`), both default `1`. `ext_item_id` is `sm_id`. |
-| API key | **ask** — environment variable `GRAIN_SM_API_KEY`. Not in the vault, not in `.grain/`, not in a config file (config is a later milestone). Absent key = offline mode, said plainly in the status row. |
+| API key | Environment variable `GRAIN_SM_API_KEY`. Not in the vault, not in `.grain/`, not in a config file (config is a later milestone). Absent key = offline mode, said plainly in the status row. |
 | Due date | `due = review_date + interval` days, where `review_date` is the local date of `graded_at`. Written to `items.due`, `items.interval`, and the card's frontmatter. |
 | Daily cap | Track requests per local day in `meta.sync_requests_today`/`meta.sync_requests_day`. Stop sending at `meta.sync_daily_cap` (default 50, the Free tier). Pending grades wait for tomorrow. |
 | Rate limit | One request in flight at a time, at least 1,100 ms apart. |
@@ -272,16 +272,14 @@ skips the file.
 - `ext_item_id` is int32. `sm_id` values above 2,147,483,647 cannot sync; the
   allocator never produces them, but an imported vault could.
 
-## Open questions
+## Resolved questions
 
-1. **ureq or reqwest?** The spec assumes ureq. Say the word if reqwest is
-   preferred; the trait boundary makes it a one-file swap.
-2. **Key location.** Environment variable is the assumption. A keychain or a
-   file under `~/.config/grain/` are the alternatives; both fit later.
-3. **Grace period length.** 5 s is a guess. Long enough to catch a slip of the
-   finger, short enough that quitting rarely waits.
-4. **Should `--auth-check` also print the server's `next-review` list for
-   today?** Cheap to add, useful for trust, one more request against the cap.
+Answered by the user on 2026-09-20.
+
+1. **HTTP client:** ureq.
+2. **Key location:** environment variable `GRAIN_SM_API_KEY`.
+3. **Grace period:** 5 seconds.
+4. **`--auth-check` and the server's due list:** no. It calls `/auth/me` only.
 
 ## Acceptance checklist
 
