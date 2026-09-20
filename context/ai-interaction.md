@@ -12,7 +12,9 @@
 
 ## Workflow
 
-The workflow for every feature or fix:
+`/feature load|start|test|review|explain|complete` drives this. The skill lives in
+`.claude/skills/feature/` and reads and writes `@context/current-feature.md`. The
+steps it enforces:
 
 1. **Document** — write the feature into `@context/current-feature.md` before
    starting. A milestone also gets a spec at
@@ -60,9 +62,12 @@ work was done. From M1 on, the branch-and-draft-PR flow above applies.
 
 ### Never rewrite pushed history
 
-No force-push, not even `--force-with-lease`, and never push to `main`. If a
-pushed branch needs squashing, ask me to squash-merge on GitHub or ask permission
-to force-push.
+Never force-push `main`, and never push code to `main` directly. A feature branch
+is force-pushed with lease only after a squash, and only with permission.
+
+One exception, and only this one: after a PR is merged, `/feature complete`
+archives the tracker, resets it, and updates the build order. That docs-only
+bookkeeping commit goes straight to `main`, with approval asked first.
 
 ## When stuck
 

@@ -44,6 +44,12 @@ A manual run writes `sm_id` into three fixture files and creates
 git checkout -- fixtures && rm -rf fixtures/vault/.grain
 ```
 
+## Feature workflow
+
+`/feature load <spec>` → `start` → `test` → `review` → `complete`. The skill in
+`.claude/skills/feature/` owns `context/current-feature.md`; read its `SKILL.md`
+before touching that file by hand.
+
 ## Before committing
 
 Both gates must pass, then check the real binary:

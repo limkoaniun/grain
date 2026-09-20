@@ -279,6 +279,4 @@ Summarize the delivered behavior in two or three bullets.
 Append-only, earliest to latest. One line per completed feature. This section is
 carried over when the tracker is reset.
 
-- `2026-09-20` **M0** — offline core: vault scan, frontmatter round-trip, Q/A extraction, SQLite sidecar, mtime-diff refresh, sm_id allocation, rename detection, queue and review screens, journal + undo. 53 tests, clippy clean. Committed on `main` before the repo existed (`3513164`).
-- `2026-09-20` **repo** — GitHub `limkoaniun/grain` created, public, MIT (Guanyu Lin), README.
-- `2026-09-20` **context** — `context/` folder, `CLAUDE.md`, and the `/feature` skill added.
+- `YYYY-MM-DD` **<key>** — `<one-line summary>` (PR #<n>)
