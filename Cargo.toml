@@ -3,6 +3,7 @@ name = "grain"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
+license = "MIT"
 description = "Terminal spaced-repetition and incremental-reading app over a markdown vault"
 
 [dependencies]

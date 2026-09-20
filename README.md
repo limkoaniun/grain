@@ -95,3 +95,7 @@ cargo clippy --all-targets
   sync happens after the commit.
 - M2: incremental-reading screen for articles.
 - Later: images (ratatui-image), audio (rodio), SuperMemo collection import.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
