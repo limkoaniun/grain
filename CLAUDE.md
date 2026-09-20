@@ -7,7 +7,8 @@ from M1; M0 is fully offline.
 
 ## Context Files
 
-Read the following to get the full context of the project
+Read the following to get the full context of the project. `context/` and
+`.claude/skills/` are gitignored: they live only on this machine.
 
 - @context/project-overview.md
 - @context/coding-standards.md

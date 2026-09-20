@@ -59,6 +59,26 @@ pub struct ItemRow {
     pub title: Option<String>,
 }
 
+/// One unsynced journal row, ready to be sent to the scheduler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingGrade {
+    pub journal_id: i64,
+    pub sm_id: i64,
+    pub grade: u8,
+    /// ISO 8601 UTC, as journaled.
+    pub graded_at: String,
+}
+
+/// The schedule a sync landed on a card: what goes into `items` alongside the journal update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Schedule {
+    pub sm_id: i64,
+    pub due: NaiveDate,
+    pub interval: i64,
+    /// The card file's mtime after `due`/`interval` were written into it.
+    pub mtime: i64,
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -122,6 +142,17 @@ impl Db {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// An integer `meta` value, or `default` when the key is absent.
+    pub fn meta_i64(&self, key: &str, default: i64) -> Result<i64> {
+        match self.meta(key)? {
+            None => Ok(default),
+            Some(v) => v
+                .trim()
+                .parse::<i64>()
+                .with_context(|| format!("meta.{key} `{v}` is not an integer")),
+        }
     }
 
     /// Hand out the next unused sm_id and persist the counter, atomically.
@@ -264,6 +295,66 @@ impl Db {
             [journal_id],
         )?;
         Ok(n == 1)
+    }
+
+    /// Persist the outbox's daily request counter (`sync_requests_day`, `sync_requests_today`).
+    pub fn set_sync_counter(&self, day: NaiveDate, count: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (key, value) in [("sync_requests_day", day.to_string()), ("sync_requests_today", count.to_string())] {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Journal rows with `synced = 0`, oldest first (`id ASC`).
+    pub fn pending_grades(&self) -> Result<Vec<PendingGrade>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, sm_id, grade, graded_at FROM journal WHERE synced = 0 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PendingGrade {
+                journal_id: r.get(0)?,
+                sm_id: r.get(1)?,
+                grade: r.get::<_, i64>(2)?.clamp(0, 5) as u8,
+                graded_at: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Record that the scheduler accepted a grade: `synced = 1` plus the returned interval,
+    /// and, when the card still exists, its new `due`/`interval`/`mtime`. One transaction.
+    pub fn apply_sync(&self, journal_id: i64, interval: i64, schedule: Option<&Schedule>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE journal SET synced = 1, interval_returned = ?2 WHERE id = ?1",
+            params![journal_id, interval],
+        )
+        .with_context(|| format!("marking journal row {journal_id} synced"))?;
+        if let Some(s) = schedule {
+            tx.execute(
+                "UPDATE items SET due = ?2, interval = ?3, mtime = ?4 WHERE sm_id = ?1",
+                params![s.sm_id, s.due.to_string(), s.interval, s.mtime],
+            )
+            .with_context(|| format!("scheduling sm_id {}", s.sm_id))?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `(synced, interval_returned)` of one journal row, for tests.
+    #[cfg(test)]
+    pub fn journal_row_sync(&self, journal_id: i64) -> Result<(i64, Option<i64>)> {
+        Ok(self.conn.query_row(
+            "SELECT synced, interval_returned FROM journal WHERE id = ?1",
+            [journal_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
     }
 
     #[cfg(test)]
@@ -457,5 +548,72 @@ mod tests {
     fn insert_grade_rejects_out_of_range() {
         let db = Db::open_in_memory().unwrap();
         assert!(db.insert_grade(1, 6, "2026-09-20T10:00:00Z").is_err());
+    }
+
+    #[test]
+    fn pending_grades_are_unsynced_rows_oldest_first() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.insert_grade(7, 3, "2026-09-20T10:00:00Z").unwrap();
+        let b = db.insert_grade(8, 5, "2026-09-20T10:00:01Z").unwrap();
+        let c = db.insert_grade(7, 4, "2026-09-20T10:00:02Z").unwrap();
+        db.apply_sync(b, 12, None).unwrap();
+        let pending = db.pending_grades().unwrap();
+        let ids: Vec<i64> = pending.iter().map(|p| p.journal_id).collect();
+        assert_eq!(ids, [a, c]);
+        assert_eq!(pending[0].sm_id, 7);
+        assert_eq!(pending[0].grade, 3);
+        assert_eq!(pending[0].graded_at, "2026-09-20T10:00:00Z");
+    }
+
+    #[test]
+    fn apply_sync_marks_row_and_updates_item_schedule_together() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_item(&card(1, "a.md", 50, None)).unwrap();
+        let id = db.insert_grade(1, 4, "2026-09-20T10:00:00Z").unwrap();
+        let schedule = Schedule {
+            sm_id: 1,
+            due: d("2026-10-02"),
+            interval: 12,
+            mtime: 555,
+        };
+        db.apply_sync(id, 12, Some(&schedule)).unwrap();
+        assert!(db.pending_grades().unwrap().is_empty());
+        assert!(!db.delete_unsynced_grade(id).unwrap(), "synced row is protected");
+        let (synced, returned): (i64, Option<i64>) = db
+            .conn
+            .query_row(
+                "SELECT synced, interval_returned FROM journal WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((synced, returned), (1, Some(12)));
+        let item = db.item(1).unwrap().unwrap();
+        assert_eq!(item.due, Some(d("2026-10-02")));
+        assert_eq!(item.interval, Some(12));
+        assert_eq!(item.mtime, 555);
+        assert_eq!(db.path_index().unwrap().get("a.md"), Some(&(1, 555)));
+    }
+
+    #[test]
+    fn apply_sync_without_schedule_leaves_item_alone() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_item(&card(1, "a.md", 50, Some("2026-09-01"))).unwrap();
+        let id = db.insert_grade(1, 4, "2026-09-20T10:00:00Z").unwrap();
+        db.apply_sync(id, 3, None).unwrap();
+        let item = db.item(1).unwrap().unwrap();
+        assert_eq!(item.due, Some(d("2026-09-01")));
+        assert_eq!(item.mtime, 100);
+    }
+
+    #[test]
+    fn meta_i64_defaults_and_parses_and_rejects_garbage() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.meta_i64("sync_daily_cap", 50).unwrap(), 50);
+        db.set_meta("sync_daily_cap", "1").unwrap();
+        assert_eq!(db.meta_i64("sync_daily_cap", 50).unwrap(), 1);
+        db.set_meta("sync_daily_cap", "lots").unwrap();
+        let err = db.meta_i64("sync_daily_cap", 50).unwrap_err().to_string();
+        assert!(err.contains("sync_daily_cap"), "{err}");
     }
 }

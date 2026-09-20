@@ -3,11 +3,15 @@
 //! Refresh = scan, skip files whose path+mtime already match, upsert the rest
 //! (allocating and writing back missing sm_ids), then drop rows for files that
 //! no longer exist. A rename shows up as a known sm_id at a new path.
+//!
+//! This module is the only writer of vault files, and it writes two things:
+//! a missing `sm_id` on first index, and `due`/`interval` after a sync.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use chrono::NaiveDate;
 
 use crate::db::{Db, ItemRow};
 use crate::vault::card::{parse_card_body, CardBody};
@@ -133,6 +137,18 @@ fn allocate_unseen(db: &Db, seen_ids: &HashSet<i64>) -> Result<i64> {
     }
 }
 
+/// Write `due` and `interval` into a card's frontmatter after a sync.
+/// Goes through [`Document::serialize`] so unknown keys survive. Returns the new mtime.
+pub fn write_schedule(root: &Path, rel_path: &str, due: NaiveDate, interval: i64) -> Result<i64> {
+    let abs = root.join(rel_path);
+    let text = std::fs::read_to_string(&abs).with_context(|| format!("reading {rel_path}"))?;
+    let mut doc = Document::parse(&text).with_context(|| format!("parsing {rel_path}"))?;
+    doc.set_schedule(due, interval);
+    let out = doc.serialize().with_context(|| format!("serializing {rel_path}"))?;
+    std::fs::write(&abs, out).with_context(|| format!("writing schedule to {rel_path}"))?;
+    mtime_of(&abs)
+}
+
 /// Read and parse a card by its vault-relative path.
 pub fn load_card(root: &Path, rel_path: &str) -> Result<LoadedCard> {
     let abs = root.join(rel_path);
@@ -168,7 +184,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::db::Db;
+    use crate::db::{Db, Schedule};
     use std::fs;
     use std::path::Path;
 
@@ -286,6 +302,47 @@ mod tests {
         let report = refresh(dir.path(), &db).unwrap();
         assert_eq!(report.skipped.len(), 2);
         assert_eq!(db.queue().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn write_schedule_rewrites_file_keeps_unknown_keys_and_returns_new_mtime() {
+        let (dir, db) = setup();
+        write(
+            dir.path(),
+            "a.md",
+            "---\ntype: card\nsm_id: 10\nprio: 30\ncustom: keep\n---\nQ: alpha?\n\nA: a\n",
+        );
+        refresh(dir.path(), &db).unwrap();
+        let before = db.item(10).unwrap().unwrap();
+        let due = chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
+        let mtime = write_schedule(dir.path(), "a.md", due, 12).unwrap();
+        let text = fs::read_to_string(dir.path().join("a.md")).unwrap();
+        assert_eq!(
+            text,
+            "---\ntype: card\nsm_id: 10\ndue: 2026-10-02\ninterval: 12\nprio: 30\ncustom: keep\n---\nQ: alpha?\n\nA: a\n"
+        );
+        assert_eq!(mtime, mtime_of(&dir.path().join("a.md")).unwrap());
+        assert!(mtime >= before.mtime);
+
+        // Recording the new mtime in the index makes the next refresh skip the file.
+        db.apply_sync(
+            db.insert_grade(10, 4, "2026-09-20T10:00:00Z").unwrap(),
+            12,
+            Some(&Schedule { sm_id: 10, due, interval: 12, mtime }),
+        )
+        .unwrap();
+        let report = refresh(dir.path(), &db).unwrap();
+        assert_eq!(report.indexed, 0, "{report:?}");
+        assert_eq!(report.unchanged, 3);
+        assert_eq!(db.item(10).unwrap().unwrap().due, Some(due));
+    }
+
+    #[test]
+    fn write_schedule_on_missing_file_names_the_path() {
+        let (dir, _db) = setup();
+        let due = chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
+        let err = write_schedule(dir.path(), "nope.md", due, 1).unwrap_err().to_string();
+        assert!(err.contains("nope.md"), "{err}");
     }
 
     #[test]
