@@ -188,10 +188,11 @@ Boundaries that matter:
 Open a vault, index it, queue, review end to end, journal, undo, quit. 53 tests,
 clippy clean, acceptance checklist verified against the real binary in a pty.
 
-### M1 — SuperMemo API client · Not started
-After each journal commit, post the grade to SM-20, store `interval_returned`,
-mark `synced = 1`, write `due`/`interval` back to the file. Async, never blocking
-the UI. Needs reqwest and probably tokio; both deliberately absent today.
+### M1 — SuperMemo sync · Spec drafted, see `features/m1-supermemo-sync-spec.md`
+After each journal commit, post the grade to `POST /algorithm/review`, store
+`interval_returned`, mark `synced = 1`, write `due`/`interval` back to the file.
+A worker thread does HTTP only; all writes stay on the UI thread. No schema or
+format change. Blocking client (ureq proposed), no tokio.
 
 ### M2 — incremental reading · Not started
 Read screen for articles, `read_pos`, extract to card, priority modal.
