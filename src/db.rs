@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::vault::frontmatter::ItemType;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS items (
@@ -44,8 +44,23 @@ CREATE TABLE IF NOT EXISTS media (hash TEXT PRIMARY KEY, path TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS meta  (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
+/// Version 1 → 2 (M2): article scheduling, `done`, and the child link. The `mtime`
+/// reset makes the next refresh re-index every file once so the new columns fill.
+const MIGRATE_V2: &str = "
+ALTER TABLE items ADD COLUMN a_factor    REAL;
+ALTER TABLE items ADD COLUMN done        TEXT;
+ALTER TABLE items ADD COLUMN source      TEXT;
+ALTER TABLE items ADD COLUMN range_start INTEGER;
+ALTER TABLE items ADD COLUMN range_end   INTEGER;
+DROP INDEX IF EXISTS idx_due;
+CREATE INDEX idx_due    ON items(due);
+CREATE INDEX idx_source ON items(source);
+UPDATE items SET mtime = 0;
+UPDATE meta SET value = '2' WHERE key = 'schema_version';
+";
+
 /// One row of `items`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ItemRow {
     pub sm_id: i64,
     pub path: String,
@@ -57,6 +72,14 @@ pub struct ItemRow {
     pub tags: String,
     pub mtime: i64,
     pub title: Option<String>,
+    /// M2: article interval multiplier as written in the file; `None` means the default.
+    pub a_factor: Option<f64>,
+    /// M2: date the article was marked done; `None` means active.
+    pub done: Option<NaiveDate>,
+    /// M2: link target of `source` without brackets or `.md` (`citrus-vocab`, `citrus-vocab/1`).
+    pub source: Option<String>,
+    /// M2: `range` as `(start, end)` character offsets into the parent body.
+    pub range: Option<(i64, i64)>,
 }
 
 /// One unsynced journal row, ready to be sent to the scheduler.
@@ -111,17 +134,24 @@ impl Db {
 
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch(SCHEMA_V1).context("creating schema")?;
-        let version = match self.meta("schema_version")? {
+        let mut version = match self.meta("schema_version")? {
             None => {
-                self.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
-                SCHEMA_VERSION
+                // A fresh database starts at 1 and takes the same steps as an old one.
+                self.set_meta("schema_version", "1")?;
+                1
             }
             Some(v) => v.parse::<i64>().context("meta.schema_version is not an integer")?,
         };
         if version > SCHEMA_VERSION {
             bail!("grain.db schema version {version} is newer than this build supports ({SCHEMA_VERSION})");
         }
-        // Future migrations go here, stepping `version` up to SCHEMA_VERSION.
+        if version == 1 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(MIGRATE_V2).context("migrating grain.db to schema version 2")?;
+            tx.commit()?;
+            version = 2;
+        }
+        debug_assert_eq!(version, SCHEMA_VERSION);
         if self.meta("next_sm_id")?.is_none() {
             self.set_meta("next_sm_id", "1")?;
         }
@@ -187,12 +217,15 @@ impl Db {
     /// Insert or replace an item by sm_id. A changed path (rename) updates the row in place.
     pub fn upsert_item(&self, item: &ItemRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO items (sm_id, path, type, due, interval, prio, read_pos, tags, mtime, title)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO items (sm_id, path, type, due, interval, prio, read_pos, tags, mtime, title,
+                                a_factor, done, source, range_start, range_end)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(sm_id) DO UPDATE SET
                path = excluded.path, type = excluded.type, due = excluded.due,
                interval = excluded.interval, prio = excluded.prio, read_pos = excluded.read_pos,
-               tags = excluded.tags, mtime = excluded.mtime, title = excluded.title",
+               tags = excluded.tags, mtime = excluded.mtime, title = excluded.title,
+               a_factor = excluded.a_factor, done = excluded.done, source = excluded.source,
+               range_start = excluded.range_start, range_end = excluded.range_end",
             params![
                 item.sm_id,
                 item.path,
@@ -204,6 +237,11 @@ impl Db {
                 item.tags,
                 item.mtime,
                 item.title,
+                item.a_factor,
+                item.done.map(|d| d.to_string()),
+                item.source,
+                item.range.map(|r| r.0),
+                item.range.map(|r| r.1),
             ],
         )
         .with_context(|| format!("indexing {}", item.path))?;
@@ -233,17 +271,61 @@ impl Db {
         Ok(n)
     }
 
-    /// All items, cards and articles mixed, ordered `prio ASC, due ASC` (NULL due first).
+    /// Every active item, cards and articles mixed, ordered `prio ASC, due ASC` (NULL due first).
+    /// Items marked `done` are left out.
     pub fn queue(&self) -> Result<Vec<ItemRow>> {
-        self.select_items("ORDER BY prio ASC, due ASC, sm_id ASC", &[])
+        self.select_items("WHERE done IS NULL ORDER BY prio ASC, due ASC, sm_id ASC", &[])
     }
 
     /// Cards with `due IS NULL OR due <= today`, in queue order.
     pub fn due_cards(&self, today: NaiveDate) -> Result<Vec<ItemRow>> {
         self.select_items(
-            "WHERE type = 'card' AND (due IS NULL OR due <= ?1) ORDER BY prio ASC, due ASC, sm_id ASC",
+            "WHERE type = 'card' AND done IS NULL AND (due IS NULL OR due <= ?1)
+             ORDER BY prio ASC, due ASC, sm_id ASC",
             &[&today.to_string()],
         )
+    }
+
+    /// Items whose `source` is `target` (a path without `.md`), by position in the parent.
+    pub fn children_of(&self, target: &str) -> Result<Vec<ItemRow>> {
+        self.select_items("WHERE source = ?1 ORDER BY range_start ASC, sm_id ASC", &[&target])
+    }
+
+    /// After a reading session: the next date, interval and read-point, plus the file's new mtime.
+    pub fn set_article_session(&self, sm_id: i64, due: NaiveDate, interval: i64, read_pos: i64, mtime: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET due = ?2, interval = ?3, read_pos = ?4, mtime = ?5 WHERE sm_id = ?1",
+            params![sm_id, due.to_string(), interval, read_pos, mtime],
+        )
+        .with_context(|| format!("scheduling article sm_id {sm_id}"))?;
+        Ok(())
+    }
+
+    pub fn set_read_pos(&self, sm_id: i64, read_pos: i64, mtime: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET read_pos = ?2, mtime = ?3 WHERE sm_id = ?1",
+            params![sm_id, read_pos, mtime],
+        )
+        .with_context(|| format!("saving read_pos for sm_id {sm_id}"))?;
+        Ok(())
+    }
+
+    pub fn set_prio(&self, sm_id: i64, prio: i64, mtime: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET prio = ?2, mtime = ?3 WHERE sm_id = ?1",
+            params![sm_id, prio, mtime],
+        )
+        .with_context(|| format!("setting prio for sm_id {sm_id}"))?;
+        Ok(())
+    }
+
+    pub fn set_done(&self, sm_id: i64, done: NaiveDate, mtime: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET done = ?2, mtime = ?3 WHERE sm_id = ?1",
+            params![sm_id, done.to_string(), mtime],
+        )
+        .with_context(|| format!("marking sm_id {sm_id} done"))?;
+        Ok(())
     }
 
     pub fn item(&self, sm_id: i64) -> Result<Option<ItemRow>> {
@@ -252,7 +334,9 @@ impl Db {
 
     fn select_items(&self, tail: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<ItemRow>> {
         let sql = format!(
-            "SELECT sm_id, path, type, due, interval, prio, read_pos, tags, mtime, title FROM items {tail}"
+            "SELECT sm_id, path, type, due, interval, prio, read_pos, tags, mtime, title,
+                    a_factor, done, source, range_start, range_end
+             FROM items {tail}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(args, |r| {
@@ -267,6 +351,11 @@ impl Db {
                 tags: r.get(7)?,
                 mtime: r.get(8)?,
                 title: r.get(9)?,
+                a_factor: r.get(10)?,
+                done: r.get(11)?,
+                source: r.get(12)?,
+                range_start: r.get(13)?,
+                range_end: r.get(14)?,
             })
         })?;
         rows.map(|r| r?.into_row()).collect()
@@ -379,16 +468,28 @@ struct RawItem {
     tags: String,
     mtime: i64,
     title: Option<String>,
+    a_factor: Option<f64>,
+    done: Option<String>,
+    source: Option<String>,
+    range_start: Option<i64>,
+    range_end: Option<i64>,
 }
 
 impl RawItem {
     fn into_row(self) -> Result<ItemRow> {
-        let due = match self.due {
-            None => None,
-            Some(s) => Some(
-                NaiveDate::parse_from_str(&s, "%Y-%m-%d")
-                    .with_context(|| format!("bad due date `{s}` for sm_id {}", self.sm_id))?,
-            ),
+        let date = |key: &str, s: Option<String>| -> Result<Option<NaiveDate>> {
+            match s {
+                None => Ok(None),
+                Some(s) => NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                    .map(Some)
+                    .with_context(|| format!("bad {key} date `{s}` for sm_id {}", self.sm_id)),
+            }
+        };
+        let due = date("due", self.due)?;
+        let done = date("done", self.done)?;
+        let range = match (self.range_start, self.range_end) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
         };
         Ok(ItemRow {
             sm_id: self.sm_id,
@@ -401,6 +502,10 @@ impl RawItem {
             tags: self.tags,
             mtime: self.mtime,
             title: self.title,
+            a_factor: self.a_factor,
+            done,
+            source: self.source,
+            range,
         })
     }
 }
@@ -411,6 +516,7 @@ mod tests {
 
     use super::*;
     use chrono::NaiveDate;
+    use std::path::Path;
 
     fn d(s: &str) -> NaiveDate {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
@@ -428,13 +534,17 @@ mod tests {
             tags: String::new(),
             mtime: 100,
             title: Some(format!("title {sm_id}")),
+            a_factor: None,
+            done: None,
+            source: None,
+            range: None,
         }
     }
 
     #[test]
     fn fresh_db_has_schema_version_and_next_sm_id() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("1"));
+        assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("2"));
         assert_eq!(db.meta("next_sm_id").unwrap().as_deref(), Some("1"));
     }
 
@@ -604,6 +714,119 @@ mod tests {
         let item = db.item(1).unwrap().unwrap();
         assert_eq!(item.due, Some(d("2026-09-01")));
         assert_eq!(item.mtime, 100);
+    }
+
+    /// A schema-version-1 database with two rows, as M0/M1 would have left it.
+    fn v1_database(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '1'), ('next_sm_id', '3')", []).unwrap();
+        conn.execute(
+            "INSERT INTO items (sm_id, path, type, due, interval, prio, read_pos, tags, mtime, title)
+             VALUES (1, 'a.md', 'card', '2026-09-25', 6, 28, NULL, '', 100, 'a'),
+                    (2, 'art.md', 'article', NULL, NULL, 20, 2210, '', 100, 'Article')",
+            [],
+        ).unwrap();
+        conn.execute("INSERT INTO journal (sm_id, grade, graded_at, synced) VALUES (1, 4, '2026-09-20T10:00:00Z', 1)", []).unwrap();
+    }
+
+    #[test]
+    fn v1_database_migrates_to_v2_in_place_keeping_rows_and_forcing_a_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grain.db");
+        v1_database(&path);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("2"));
+        assert_eq!(SCHEMA_VERSION, 2);
+        let items = db.queue().unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| i.mtime == 0), "mtime zeroed so the next refresh re-indexes: {items:?}");
+        assert!(items.iter().all(|i| i.a_factor.is_none() && i.done.is_none() && i.source.is_none() && i.range.is_none()));
+        assert_eq!(db.journal_count(1).unwrap(), 1);
+        assert_eq!(db.meta("next_sm_id").unwrap().as_deref(), Some("3"));
+        drop(db);
+        let again = Db::open(&path).unwrap();
+        assert_eq!(again.meta("schema_version").unwrap().as_deref(), Some("2"), "idempotent");
+        let cols: Vec<String> = again
+            .conn
+            .prepare("PRAGMA table_info(items)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        for c in ["a_factor", "done", "source", "range_start", "range_end"] {
+            assert!(cols.iter().any(|x| x == c), "missing column {c}: {cols:?}");
+        }
+    }
+
+    #[test]
+    fn newer_database_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grain.db");
+        v1_database(&path);
+        Connection::open(&path).unwrap().execute("UPDATE meta SET value = '99' WHERE key = 'schema_version'", []).unwrap();
+        assert!(Db::open(&path).is_err());
+    }
+
+    fn article(sm_id: i64, path: &str, prio: i64, due: Option<&str>) -> ItemRow {
+        let mut row = card(sm_id, path, prio, due);
+        row.kind = ItemType::Article;
+        row
+    }
+
+    #[test]
+    fn done_items_are_hidden_from_the_queue_and_from_due_cards() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_item(&article(1, "a.md", 20, None)).unwrap();
+        db.upsert_item(&article(2, "b.md", 20, Some("2026-09-25"))).unwrap();
+        let mut done = article(3, "c.md", 5, None);
+        done.done = Some(d("2026-09-21"));
+        db.upsert_item(&done).unwrap();
+        db.upsert_item(&card(4, "k.md", 10, None)).unwrap();
+        let ids: Vec<i64> = db.queue().unwrap().iter().map(|i| i.sm_id).collect();
+        assert_eq!(ids, [4, 1, 2], "done hidden; prio then due");
+        let due: Vec<i64> = db.due_cards(d("2026-09-20")).unwrap().iter().map(|i| i.sm_id).collect();
+        assert_eq!(due, [4], "due_cards stays cards only and skips done");
+    }
+
+    #[test]
+    fn source_and_range_round_trip_and_children_of_orders_by_range() {
+        let db = Db::open_in_memory().unwrap();
+        let mut c1 = card(10, "citrus-vocab/2.md", 20, None);
+        c1.source = Some("citrus-vocab".to_string());
+        c1.range = Some((153, 205));
+        let mut c2 = card(11, "citrus-vocab/1.md", 20, None);
+        c2.source = Some("citrus-vocab".to_string());
+        c2.range = Some((83, 89));
+        let mut other = card(12, "x.md", 20, None);
+        other.source = Some("elsewhere".to_string());
+        for r in [&c1, &c2, &other] {
+            db.upsert_item(r).unwrap();
+        }
+        let kids = db.children_of("citrus-vocab").unwrap();
+        assert_eq!(kids.iter().map(|k| k.sm_id).collect::<Vec<_>>(), [11, 10]);
+        assert_eq!(kids[0].range, Some((83, 89)));
+        assert_eq!(db.item(12).unwrap().unwrap().source.as_deref(), Some("elsewhere"));
+    }
+
+    #[test]
+    fn article_setters_update_the_row_and_its_mtime() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_item(&article(1, "a.md", 20, None)).unwrap();
+        db.set_article_session(1, d("2026-09-29"), 7, 118, 501).unwrap();
+        let row = db.item(1).unwrap().unwrap();
+        assert_eq!((row.due, row.interval, row.read_pos, row.mtime), (Some(d("2026-09-29")), Some(7), Some(118), 501));
+        db.set_read_pos(1, 153, 502).unwrap();
+        let row = db.item(1).unwrap().unwrap();
+        assert_eq!((row.read_pos, row.mtime), (Some(153), 502));
+        db.set_prio(1, 30, 503).unwrap();
+        let row = db.item(1).unwrap().unwrap();
+        assert_eq!((row.prio, row.mtime), (30, 503));
+        db.set_done(1, d("2026-09-30"), 504).unwrap();
+        let row = db.item(1).unwrap().unwrap();
+        assert_eq!((row.done, row.mtime), (Some(d("2026-09-30")), 504));
+        assert!(db.queue().unwrap().is_empty());
     }
 
     #[test]

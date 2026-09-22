@@ -7,11 +7,11 @@ use ratatui::Frame;
 
 use crate::app::App;
 use crate::db::ItemRow;
-use crate::vault::frontmatter::ItemType;
 
 pub const HINTS: &[(&str, &str)] = &[
     ("j/k", "move"),
     ("enter", "open"),
+    ("p", "prio"),
     ("tab", "review"),
     ("q", "quit"),
 ];
@@ -39,10 +39,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
 fn row(item: &ItemRow) -> Row<'_> {
     let kind = item.kind.as_str();
-    let due = match (item.kind, item.due) {
-        (ItemType::Article, _) => "—".to_string(),
-        (ItemType::Card, None) => "now".to_string(),
-        (ItemType::Card, Some(d)) => d.to_string(),
+    let due = match item.due {
+        None => "now".to_string(),
+        Some(d) => d.to_string(),
     };
     let title = item.title.clone().unwrap_or_else(|| item.path.clone());
     Row::new([kind.to_string(), item.prio.to_string(), due, title])

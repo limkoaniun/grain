@@ -33,7 +33,7 @@ impl ItemType {
 }
 
 /// Typed view of the frontmatter keys grain understands.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ItemMeta {
     pub kind: ItemType,
     pub sm_id: Option<i64>,
@@ -44,6 +44,10 @@ pub struct ItemMeta {
     pub source: Option<String>,
     pub range: Option<String>,
     pub tags: Vec<String>,
+    /// Article interval multiplier (M2). `None` means the default, 1.5.
+    pub a_factor: Option<f64>,
+    /// Article finished on this date (M2). `None` means active.
+    pub done: Option<NaiveDate>,
 }
 
 /// A markdown file split into its YAML frontmatter and body.
@@ -103,6 +107,8 @@ impl Document {
             source: self.string("source")?,
             range: self.string("range")?,
             tags: self.tags()?,
+            a_factor: self.float("a_factor")?,
+            done: self.date("done")?,
         })
     }
 
@@ -116,6 +122,49 @@ impl Document {
     pub fn set_schedule(&mut self, due: NaiveDate, interval: i64) {
         self.set_after("due", Value::from(due.to_string()), &["sm_id", "type"]);
         self.set_after("interval", Value::from(interval), &["due", "sm_id", "type"]);
+    }
+
+    // The M2 setters keep new keys in the documented order:
+    // due, interval, prio, read_pos, a_factor, done, source, range.
+
+    pub fn set_prio(&mut self, prio: i64) {
+        self.set_after("prio", Value::from(prio), &["interval", "due", "sm_id", "type"]);
+    }
+
+    pub fn set_read_pos(&mut self, read_pos: i64) {
+        self.set_after("read_pos", Value::from(read_pos), &["prio", "interval", "due", "sm_id", "type"]);
+    }
+
+    /// Whole values are written as integers (`2`, not `2.0`) so a copied key reads the same.
+    pub fn set_a_factor(&mut self, a_factor: f64) {
+        let value = if a_factor.fract() == 0.0 && a_factor.abs() < 1e9 {
+            Value::from(a_factor as i64)
+        } else {
+            Value::from(a_factor)
+        };
+        self.set_after("a_factor", value, &["read_pos", "prio", "interval", "due", "sm_id", "type"]);
+    }
+
+    pub fn set_done(&mut self, done: NaiveDate) {
+        self.set_after(
+            "done",
+            Value::from(done.to_string()),
+            &["a_factor", "read_pos", "prio", "interval", "due", "sm_id", "type"],
+        );
+    }
+
+    /// `source: "[[target]]"` and `range: "start-end"`, for a child of `target`.
+    pub fn set_source_range(&mut self, target: &str, range: &str) {
+        self.set_after(
+            "source",
+            Value::from(format!("[[{target}]]")),
+            &["done", "a_factor", "read_pos", "prio", "interval", "due", "sm_id", "type"],
+        );
+        self.set_after(
+            "range",
+            Value::from(range),
+            &["source", "done", "a_factor", "read_pos", "prio", "interval", "due", "sm_id", "type"],
+        );
     }
 
     /// Overwrite `key` in place, or insert it after the first of `anchors` that
@@ -161,6 +210,22 @@ impl Document {
                 .map(Some)
                 .with_context(|| format!("frontmatter `{key}` must be an integer")),
             Some(_) => bail!("frontmatter `{key}` must be an integer"),
+        }
+    }
+
+    fn float(&self, key: &str) -> Result<Option<f64>> {
+        match self.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(n)) => n
+                .as_f64()
+                .ok_or_else(|| anyhow!("frontmatter `{key}` must be a number"))
+                .map(Some),
+            Some(Value::String(s)) => s
+                .trim()
+                .parse::<f64>()
+                .map(Some)
+                .with_context(|| format!("frontmatter `{key}` must be a number")),
+            Some(_) => bail!("frontmatter `{key}` must be a number"),
         }
     }
 
@@ -320,6 +385,45 @@ mod tests {
         doc.set_schedule(NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(), 1);
         let out = doc.serialize().unwrap();
         assert!(out.starts_with("---\ntype: card\ndue: 2026-10-02\ninterval: 1\nprio: 40\n---\n"), "{out}");
+    }
+
+    #[test]
+    fn article_parses_a_factor_and_done_and_defaults_them_to_none() {
+        let doc = Document::parse("---\ntype: article\na_factor: 1.5\ndone: 2026-09-22\n---\nbody\n").unwrap();
+        let meta = doc.meta().unwrap();
+        assert_eq!(meta.a_factor, Some(1.5));
+        assert_eq!(meta.done, NaiveDate::from_ymd_opt(2026, 9, 22));
+        let doc = Document::parse("---\ntype: article\na_factor: 2\n---\nbody\n").unwrap();
+        assert_eq!(doc.meta().unwrap().a_factor, Some(2.0));
+        let doc = Document::parse("---\ntype: article\n---\nbody\n").unwrap();
+        let meta = doc.meta().unwrap();
+        assert_eq!(meta.a_factor, None);
+        assert_eq!(meta.done, None);
+        assert!(Document::parse("---\ntype: article\ndone: soon\n---\nbody\n").is_err());
+        assert!(Document::parse("---\ntype: article\na_factor: fast\n---\nbody\n").is_err());
+    }
+
+    #[test]
+    fn article_setters_insert_in_documented_order_and_keep_unknown_keys() {
+        let mut doc = Document::parse("---\ntype: article\nsm_id: 1001\nprio: 20\ntags: [citrus]\n---\n# T\n").unwrap();
+        doc.set_read_pos(118);
+        doc.set_schedule(NaiveDate::from_ymd_opt(2026, 9, 29).unwrap(), 7);
+        doc.set_a_factor(1.5);
+        doc.set_done(NaiveDate::from_ymd_opt(2026, 9, 30).unwrap());
+        doc.set_source_range("citrus-vocab", "118-124");
+        let out = doc.serialize().unwrap();
+        assert_eq!(
+            out,
+            "---\ntype: article\nsm_id: 1001\ndue: 2026-09-29\ninterval: 7\nprio: 20\nread_pos: 118\na_factor: 1.5\ndone: 2026-09-30\nsource: '[[citrus-vocab]]'\nrange: 118-124\ntags:\n- citrus\n---\n# T\n"
+        );
+        let meta = Document::parse(&out).unwrap().meta().unwrap();
+        assert_eq!(meta.read_pos, Some(118));
+        assert_eq!(meta.source.as_deref(), Some("[[citrus-vocab]]"));
+        assert_eq!(meta.range.as_deref(), Some("118-124"));
+        doc.set_prio(30);
+        doc.set_read_pos(0);
+        let out = doc.serialize().unwrap();
+        assert!(out.contains("\nprio: 30\nread_pos: 0\n"), "existing keys keep their place: {out}");
     }
 
     #[test]
