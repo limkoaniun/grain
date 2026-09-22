@@ -192,6 +192,59 @@ mod tests {
     }
 
     #[test]
+    fn status_row_shows_unsynced_count_on_both_screens_until_undone() {
+        let (_d, mut app) = {
+            let dir = tempfile::tempdir().unwrap();
+            let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/vault");
+            for entry in std::fs::read_dir(&src).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    std::fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
+                }
+            }
+            let today = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+            let fake = crate::sync::api::FakeScheduler::always_ok();
+            let app = App::open_with_scheduler(dir.path(), today, Box::new(fake)).unwrap();
+            (dir, app)
+        };
+        app.handle_key(KeyCode::Tab).unwrap();
+        app.handle_key(KeyCode::Char(' ')).unwrap();
+        app.handle_key(KeyCode::Char('4')).unwrap();
+        let r = rows(&app);
+        assert!(r[0].ends_with("card · prio 35 · due 4 · done 1/4 · 1 unsynced"), "{:?}", r[0]);
+        assert!(r.join("\n").contains("graded 4 · journaled · sync in 5s"), "{r:?}");
+        app.handle_key(KeyCode::Tab).unwrap();
+        let r = rows(&app);
+        assert!(r[0].ends_with("queue · sort prio · 1 unsynced"), "{:?}", r[0]);
+        app.handle_key(KeyCode::Tab).unwrap();
+        app.handle_key(KeyCode::Char('u')).unwrap();
+        let r = rows(&app);
+        assert!(r[0].ends_with("card · prio 12 · due 4 · done 0/4"), "{:?}", r[0]);
+    }
+
+    #[test]
+    fn every_sync_status_line_variant_renders_in_full() {
+        let (_d, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        app.handle_key(KeyCode::Char(' ')).unwrap();
+        for line in [
+            "graded 4 · journaled (offline)",
+            "graded 4 · journaled · sync in 3s",
+            "graded 4 · syncing…",
+            "graded 4 · synced · interval 12 · due 2026-10-02",
+            "graded 4 · sync failed (connection refused) · retry in 8s",
+            "graded 4 · journaled · daily cap reached, resumes tomorrow",
+            "sync stopped · 401 unauthorized · check GRAIN_SM_API_KEY",
+            "graded 4 · rejected by API (grade: must be ≤ 5) · kept unsynced",
+            "cannot undo · already sent to SuperMemo",
+        ] {
+            app.review.status = Some(line.to_string());
+            let all = rows(&app).join("\n");
+            assert!(all.contains(line), "missing {line:?} in\n{all}");
+        }
+    }
+
+    #[test]
     fn renders_at_narrow_sizes_without_panicking() {
         let (_d, mut app) = fixture_app();
         for (w, h) in [(20u16, 3u16), (1, 1), (0, 0), (40, 2)] {

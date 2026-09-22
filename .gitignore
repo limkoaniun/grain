@@ -1,3 +1,6 @@
 /target
 /fixtures/vault/.grain/
 /vault/.grain/
+# Local-only working docs and project skills; never committed.
+/context/
+/.claude/skills/

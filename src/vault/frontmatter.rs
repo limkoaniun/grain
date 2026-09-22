@@ -108,22 +108,39 @@ impl Document {
 
     /// Set `sm_id`, placing it right after `type` for a new key so files stay tidy.
     pub fn set_sm_id(&mut self, sm_id: i64) {
-        let key = Value::from("sm_id");
+        self.set_after("sm_id", Value::from(sm_id), &["type"]);
+    }
+
+    /// Set `due` and `interval` after a sync. New keys go right after `sm_id`
+    /// (or `type` when there is no `sm_id`); existing keys keep their position.
+    pub fn set_schedule(&mut self, due: NaiveDate, interval: i64) {
+        self.set_after("due", Value::from(due.to_string()), &["sm_id", "type"]);
+        self.set_after("interval", Value::from(interval), &["due", "sm_id", "type"]);
+    }
+
+    /// Overwrite `key` in place, or insert it after the first of `anchors` that
+    /// exists (appending when none does). Unknown keys and their order survive.
+    fn set_after(&mut self, key: &str, value: Value, anchors: &[&str]) {
+        let key = Value::from(key);
         if self.front.contains_key(&key) {
-            self.front.insert(key, Value::from(sm_id));
+            self.front.insert(key, value);
             return;
         }
+        let anchor = anchors
+            .iter()
+            .find(|a| self.front.contains_key(Value::from(**a)))
+            .copied();
         let mut rebuilt = Mapping::with_capacity(self.front.len() + 1);
         let mut inserted = false;
         for (k, v) in self.front.iter() {
             rebuilt.insert(k.clone(), v.clone());
-            if k.as_str() == Some("type") {
-                rebuilt.insert(key.clone(), Value::from(sm_id));
+            if !inserted && k.as_str() == anchor {
+                rebuilt.insert(key.clone(), value.clone());
                 inserted = true;
             }
         }
         if !inserted {
-            rebuilt.insert(key, Value::from(sm_id));
+            rebuilt.insert(key, value);
         }
         self.front = rebuilt;
     }
@@ -267,6 +284,42 @@ mod tests {
         let out = doc.serialize().unwrap();
         assert!(out.starts_with("---\ntype: card\nsm_id: 7\nprio: 40\n---\n"), "{out}");
         assert_eq!(Document::parse(&out).unwrap().meta().unwrap().sm_id, Some(7));
+    }
+
+    #[test]
+    fn set_schedule_inserts_after_sm_id_when_absent_and_keeps_position_otherwise() {
+        let mut doc =
+            Document::parse("---\ntype: card\nsm_id: 7\nprio: 40\nextra: x\n---\nQ: q\nA: a\n").unwrap();
+        doc.set_schedule(NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(), 12);
+        let out = doc.serialize().unwrap();
+        assert!(
+            out.starts_with("---\ntype: card\nsm_id: 7\ndue: 2026-10-02\ninterval: 12\nprio: 40\nextra: x\n---\n"),
+            "{out}"
+        );
+        let meta = Document::parse(&out).unwrap().meta().unwrap();
+        assert_eq!(meta.due, NaiveDate::from_ymd_opt(2026, 10, 2));
+        assert_eq!(meta.interval, Some(12));
+
+        let mut doc = Document::parse(CARD).unwrap();
+        doc.set_schedule(NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(), 12);
+        let out = doc.serialize().unwrap();
+        let keys: Vec<String> = Document::parse(&out)
+            .unwrap()
+            .front
+            .keys()
+            .filter_map(|k| k.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(keys, ["type", "sm_id", "due", "interval", "prio", "source", "range", "custom_key"]);
+        assert!(out.contains("due: 2026-10-02\ninterval: 12\n"), "{out}");
+        assert!(out.contains("custom_key: keep me\n"), "{out}");
+    }
+
+    #[test]
+    fn set_schedule_without_sm_id_appends_after_type() {
+        let mut doc = Document::parse("---\ntype: card\nprio: 40\n---\nQ: q\nA: a\n").unwrap();
+        doc.set_schedule(NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(), 1);
+        let out = doc.serialize().unwrap();
+        assert!(out.starts_with("---\ntype: card\ndue: 2026-10-02\ninterval: 1\nprio: 40\n---\n"), "{out}");
     }
 
     #[test]
