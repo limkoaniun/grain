@@ -217,17 +217,45 @@ impl App {
         let Some(sync) = self.sync.as_mut() else {
             return Ok(());
         };
-        while let Some(result) = sync.worker.try_recv() {
-            let landed = sync.outbox.complete(result.journal_id, result.outcome, now);
-            Self::record(&self.db, &self.root, &mut self.last_grade, &mut self.sync_log, landed)?;
+        let mut worker_gone = false;
+        loop {
+            match sync.worker.try_recv() {
+                Ok(Some(result)) => {
+                    let landed = sync.outbox.complete(result.journal_id, result.outcome, now);
+                    Self::record(&self.db, &self.root, &mut self.last_grade, &mut self.sync_log, landed)?;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    worker_gone = true;
+                    break;
+                }
+            }
         }
-        if let Some(req) = sync.outbox.poll(now, today) {
+        if !worker_gone {
+            if let Some(req) = sync.outbox.poll(now, today) {
+                let journal_id = req.journal_id;
+                if sync.worker.send(req) {
+                    if let (Some(day), count) = sync.outbox.counter() {
+                        self.db.set_sync_counter(day, count)?;
+                    }
+                } else {
+                    sync.outbox.abort(journal_id, now);
+                    worker_gone = true;
+                }
+            }
+        }
+        if worker_gone {
+            // The thread is dead: hand back whatever it was holding, persist the refund, and
+            // fall back to offline mode. Rows stay synced = 0 on disk for the next session.
+            if let Some(req) = sync.outbox.in_flight().cloned() {
+                sync.outbox.abort(req.journal_id, now);
+            }
             if let (Some(day), count) = sync.outbox.counter() {
                 self.db.set_sync_counter(day, count)?;
             }
-            if !sync.worker.send(req) {
-                self.sync_log.push("sync worker exited; grades stay pending".to_string());
-            }
+            let pending = sync.outbox.pending_count();
+            self.sync_log.push(format!("sync worker exited; {pending} grades stay pending until the next start"));
+            self.sync = None;
         }
         if self.last_grade.is_some() {
             self.review.status = self.sync_status();
@@ -260,11 +288,13 @@ impl App {
                 std::thread::sleep(Duration::from_millis(25));
                 continue;
             };
+            let journal_id = req.journal_id;
+            if !sync.worker.send(req) {
+                sync.outbox.abort(journal_id, Instant::now());
+                break;
+            }
             if let (Some(day), count) = sync.outbox.counter() {
                 self.db.set_sync_counter(day, count)?;
-            }
-            if !sync.worker.send(req) {
-                break;
             }
             let left = QUIT_DRAIN_BUDGET.saturating_sub(start.elapsed());
             let Some(result) = sync.worker.recv_timeout(left) else {
@@ -291,19 +321,24 @@ impl App {
                     .review_date
                     .checked_add_days(chrono::Days::new(interval.max(0) as u64))
                     .with_context(|| format!("interval {interval} overflows the due date"))?;
+                // The server has the review either way. If the file cannot be rewritten the
+                // index still takes the schedule (mtime untouched) so the card leaves today's queue.
                 let schedule = match db.item(req.sm_id)? {
-                    Some(item) => match write_schedule(root, &item.path, due, interval) {
-                        Ok(mtime) => Some(Schedule {
+                    Some(item) => {
+                        let mtime = match write_schedule(root, &item.path, due, interval) {
+                            Ok(mtime) => mtime,
+                            Err(e) => {
+                                log.push(format!("{}: could not write schedule ({e:#})", item.path));
+                                item.mtime
+                            }
+                        };
+                        Some(Schedule {
                             sm_id: req.sm_id,
                             due,
                             interval,
                             mtime,
-                        }),
-                        Err(e) => {
-                            log.push(format!("{}: could not write schedule ({e:#})", item.path));
-                            None
-                        }
-                    },
+                        })
+                    }
                     None => None,
                 };
                 db.apply_sync(req.journal_id, interval, schedule.as_ref())?;
@@ -970,6 +1005,29 @@ mod tests {
         assert!(status(&app).starts_with("graded 4 · synced"), "{}", status(&app));
         assert_eq!(app.sync_log.len(), 1, "{:?}", app.sync_log);
         assert!(app.sync_log[0].contains(&path), "{:?}", app.sync_log);
+        // The index still takes the schedule so the card leaves today's queue; mtime is untouched.
+        let item = app.db.item(1044).unwrap().unwrap();
+        assert_eq!(item.interval, Some(12));
+        assert_eq!(item.due, Some(review_date() + chrono::Days::new(12)));
+    }
+
+    #[test]
+    fn a_dead_worker_drops_to_offline_and_keeps_the_row_pending() {
+        let (_d, mut app) = synced_app(FakeScheduler::panicking(), &[("sync_grace_secs", "0")]);
+        app.handle_key(KeyCode::Tab).unwrap();
+        let (sm_id, _) = grade_current(&mut app, '4');
+        tick(&mut app, Duration::ZERO);
+        // The worker panics on this request; wait for the app to notice the thread is gone.
+        tick_until(&mut app, Duration::ZERO, |a| !a.sync_log.is_empty());
+        assert!(app.sync_log[0].contains("sync worker exited"), "{:?}", app.sync_log);
+        assert_eq!(status(&app), "graded 4 · journaled (offline)");
+        assert_eq!(app.queue_context(), "queue · sort prio", "no outbox any more");
+        assert_eq!(app.db.pending_grades().unwrap().len(), 1, "row survives for the next session");
+        assert_eq!(app.db.meta("sync_requests_today").unwrap().as_deref(), Some("0"), "counter refunded");
+        press(&mut app, 'u');
+        assert_eq!(status(&app), "undid grade 4", "not stuck as in flight");
+        assert_eq!(app.db.journal_count(sm_id).unwrap(), 0);
+        assert_eq!(app.finish().unwrap(), 0);
     }
 
     #[test]
