@@ -2,13 +2,17 @@
 //! and nothing else. Requests come in on a channel, results go back on another.
 //! No database, no filesystem.
 
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use crate::sync::api::{Identity, ReviewRequest, Scheduler};
 use crate::sync::{SyncRequest, SyncResult};
+
+/// The worker thread is gone: it will neither take requests nor answer them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerGone;
 
 /// The UI thread's end of the worker. Dropping it ends the thread.
 pub struct Worker {
@@ -22,9 +26,13 @@ impl Worker {
         self.tx.send(req).is_ok()
     }
 
-    /// A finished result, if one is waiting.
-    pub fn try_recv(&self) -> Option<SyncResult> {
-        self.rx.try_recv().ok()
+    /// A finished result if one is waiting, `None` if not yet, `Err` once the thread has died.
+    pub fn try_recv(&self) -> Result<Option<SyncResult>, WorkerGone> {
+        match self.rx.try_recv() {
+            Ok(r) => Ok(Some(r)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(WorkerGone),
+        }
     }
 
     /// Wait up to `timeout` for a result.
@@ -128,6 +136,6 @@ mod tests {
         let result = worker.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(matches!(result.outcome, Err(ApiError::Rejected { .. })), "{:?}", result.outcome);
         assert!(seen.lock().unwrap().is_empty());
-        assert!(worker.try_recv().is_none());
+        assert_eq!(worker.try_recv(), Ok(None));
     }
 }

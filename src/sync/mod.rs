@@ -176,6 +176,17 @@ impl Outbox {
         Some(queued.req)
     }
 
+    /// Take back the row in flight without a reply (the worker could not take it or has
+    /// gone away): it returns to the head of the queue and its request is refunded.
+    pub fn abort(&mut self, journal_id: i64, now: Instant) -> bool {
+        let Some(req) = self.in_flight.take_if(|r| r.journal_id == journal_id) else {
+            return false;
+        };
+        self.requests_today = self.requests_today.saturating_sub(1);
+        self.queue.push_front(Queued { req, ready_at: now });
+        true
+    }
+
     /// Record the worker's reply for the row in flight.
     pub fn complete(&mut self, journal_id: i64, outcome: Result<Reviewed, ApiError>, now: Instant) -> Landed {
         let Some(req) = self.in_flight.take_if(|r| r.journal_id == journal_id) else {
@@ -189,7 +200,11 @@ impl Outbox {
                     interval: reviewed.interval,
                 }
             }
-            Err(e @ ApiError::Transient { .. }) => {
+            Err(e @ (ApiError::Transient { .. } | ApiError::Unreachable { .. })) => {
+                if matches!(e, ApiError::Unreachable { .. }) {
+                    // The server never saw it, so it does not count against the day's budget.
+                    self.requests_today = self.requests_today.saturating_sub(1);
+                }
                 let attempt = self.backoff.as_ref().map_or(1, |b| b.attempt + 1);
                 let after = BACKOFF_BASE
                     .saturating_mul(1u32 << (attempt - 1).min(5))
@@ -506,6 +521,66 @@ mod tests {
         assert_eq!(ob.poll(t1 + Duration::from_secs(2), today), Some(req(2)), "moves on");
         assert!(ob.cancel(1), "a rejected row was never recorded server-side, so undo may remove it");
         assert_eq!(ob.pending_count(), 1);
+    }
+
+    #[test]
+    fn unreachable_failure_refunds_the_daily_counter_but_a_server_error_does_not() {
+        let t0 = Instant::now();
+        let today = day("2026-09-20");
+        let mut ob = outbox(50);
+        ob.enqueue(req(1), t0);
+        let t1 = t0 + Duration::from_secs(5);
+        assert_eq!(ob.poll(t1, today), Some(req(1)));
+        assert_eq!(ob.counter(), (Some(today), 1));
+        let landed = ob.complete(
+            1,
+            Err(ApiError::Unreachable { reason: "connection refused".to_string() }),
+            t1,
+        );
+        assert!(matches!(landed, Landed::Retry { .. }), "{landed:?}");
+        assert_eq!(ob.counter(), (Some(today), 0), "never reached the server");
+        assert_eq!(ob.state(1, t1), RowState::Retrying { reason: "connection refused".to_string(), secs: 2 });
+
+        let t2 = t1 + Duration::from_secs(3);
+        assert_eq!(ob.poll(t2, today), Some(req(1)));
+        assert_eq!(ob.counter(), (Some(today), 1));
+        ob.complete(1, Err(ApiError::Transient { reason: "503 service unavailable".to_string() }), t2);
+        assert_eq!(ob.counter(), (Some(today), 1), "the server saw this one");
+    }
+
+    #[test]
+    fn a_network_outage_does_not_exhaust_the_daily_cap() {
+        let t0 = Instant::now();
+        let today = day("2026-09-20");
+        let mut ob = outbox(3);
+        ob.enqueue(req(1), t0);
+        let mut t = t0 + Duration::from_secs(5);
+        for _ in 0..10 {
+            assert_eq!(ob.poll(t, today), Some(req(1)), "still sendable after {t:?}");
+            let Landed::Retry { after, .. } = ob.complete(1, Err(ApiError::Unreachable { reason: "timed out".to_string() }), t) else {
+                panic!("expected retry");
+            };
+            t += after;
+        }
+        assert_eq!(ob.poll(t, today), Some(req(1)));
+        assert!(matches!(ob.complete(1, ok(), t), Landed::Synced { .. }));
+        assert_eq!(ob.counter(), (Some(today), 1));
+    }
+
+    #[test]
+    fn abort_returns_the_row_in_flight_to_the_queue_and_refunds_the_counter() {
+        let t0 = Instant::now();
+        let today = day("2026-09-20");
+        let mut ob = outbox(50);
+        ob.enqueue(req(1), t0);
+        let t1 = t0 + Duration::from_secs(5);
+        assert_eq!(ob.poll(t1, today), Some(req(1)));
+        assert!(ob.abort(1, t1));
+        assert!(!ob.abort(1, t1), "nothing in flight now");
+        assert_eq!(ob.counter(), (Some(today), 0));
+        assert!(ob.in_flight().is_none());
+        assert_eq!(ob.pending_count(), 1);
+        assert!(ob.cancel(1), "undo works again");
     }
 
     #[test]

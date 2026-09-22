@@ -97,8 +97,11 @@ pub enum ApiError {
     Unauthorized { status: u16, message: String },
     /// 422 or another client-side rejection. The row is kept unsynced and skipped this session.
     Rejected { message: String },
-    /// 5xx, 429 or a transport failure. Retried with backoff.
+    /// 5xx or 429: the server saw the request and could not take it. Retried with backoff.
     Transient { reason: String },
+    /// Transport failure: the request never reached the server. Retried with backoff,
+    /// and not counted against the daily request budget.
+    Unreachable { reason: String },
 }
 
 impl ApiError {
@@ -107,7 +110,7 @@ impl ApiError {
         match self {
             ApiError::Unauthorized { status, .. } => format!("{status} {}", reason_phrase(*status)),
             ApiError::Rejected { message } => message.clone(),
-            ApiError::Transient { reason } => reason.clone(),
+            ApiError::Transient { reason } | ApiError::Unreachable { reason } => reason.clone(),
         }
     }
 }
@@ -117,7 +120,7 @@ impl fmt::Display for ApiError {
         match self {
             ApiError::Unauthorized { status, message } => write!(f, "{status} {}: {message}", reason_phrase(*status)),
             ApiError::Rejected { message } => write!(f, "rejected by API: {message}"),
-            ApiError::Transient { reason } => write!(f, "sync failed: {reason}"),
+            ApiError::Transient { reason } | ApiError::Unreachable { reason } => write!(f, "sync failed: {reason}"),
         }
     }
 }
@@ -252,7 +255,7 @@ fn transport_error(e: ureq::Error) -> ApiError {
         ureq::Error::ConnectionFailed => "connection failed".to_string(),
         other => other.to_string(),
     };
-    ApiError::Transient { reason }
+    ApiError::Unreachable { reason }
 }
 
 fn reason_phrase(status: u16) -> String {
@@ -271,6 +274,7 @@ pub struct FakeScheduler {
     pub script: std::sync::Mutex<std::collections::VecDeque<Result<Reviewed, ApiError>>>,
     pub gate: Option<std::sync::mpsc::Receiver<()>>,
     pub seen: std::sync::Arc<std::sync::Mutex<Vec<ReviewRequest>>>,
+    pub panic: bool,
 }
 
 #[cfg(test)]
@@ -280,11 +284,19 @@ impl FakeScheduler {
             script: std::sync::Mutex::new(script.into()),
             gate: None,
             seen: std::sync::Arc::default(),
+            panic: false,
         }
     }
 
     pub fn always_ok() -> Self {
         Self::new(Vec::new())
+    }
+
+    /// Panics on the first review, taking the worker thread down with it.
+    pub fn panicking() -> Self {
+        let mut fake = Self::always_ok();
+        fake.panic = true;
+        fake
     }
 
     /// Hold every review until a `()` arrives on the returned sender.
@@ -299,6 +311,7 @@ impl FakeScheduler {
 #[cfg(test)]
 impl Scheduler for FakeScheduler {
     fn review(&self, req: &ReviewRequest) -> Result<Reviewed, ApiError> {
+        assert!(!self.panic, "FakeScheduler::panicking: simulated worker crash");
         if let Some(gate) = &self.gate {
             let _ = gate.recv();
         }
@@ -482,7 +495,7 @@ mod tests {
         drop(listener);
         let client = UreqScheduler::with_base_url("k", &base);
         let err = client.review(&review_req()).unwrap_err();
-        assert!(matches!(err, ApiError::Transient { .. }), "{err:?}");
+        assert!(matches!(err, ApiError::Unreachable { .. }), "never reached the server: {err:?}");
         assert_eq!(err.summary(), "connection refused");
     }
 
