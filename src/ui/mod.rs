@@ -2,6 +2,7 @@
 //! status row, content, key hints. Screens are pure functions of `&App`.
 
 mod queue;
+mod read;
 mod review;
 
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -25,19 +26,40 @@ pub fn render(frame: &mut Frame, app: &App) {
             Constraint::Length(1),
         ]));
 
+    // The status row's middle: the priority prompt, else a notice, else the selection.
+    let middle = app
+        .prompt_text()
+        .or_else(|| app.notice.clone())
+        .or_else(|| app.selection_status());
+    let prompt_open = app.prompt_text().is_some();
     match app.screen {
         Screen::Queue => {
-            status_row(frame, top, app.notice.as_deref(), &app.queue_context());
+            status_row(frame, top, middle.as_deref(), &app.queue_context());
             queue::render(frame, content, app);
-            hints_row(frame, hints, queue::HINTS);
+            hints_row(frame, hints, if prompt_open { PROMPT_HINTS } else { queue::HINTS });
         }
         Screen::Review => {
-            status_row(frame, top, app.notice.as_deref(), &app.review_context());
+            status_row(frame, top, middle.as_deref(), &app.review_context());
             review::render(frame, content, app);
             hints_row(frame, hints, review::HINTS);
         }
+        Screen::Read => {
+            status_row(frame, top, middle.as_deref(), &app.read_context());
+            read::render(frame, content, app);
+            let hints_for = if prompt_open {
+                PROMPT_HINTS
+            } else if app.selection_status().is_some() {
+                read::SELECT_HINTS
+            } else {
+                read::HINTS
+            };
+            hints_row(frame, hints, hints_for);
+        }
     }
 }
+
+/// Hints while the priority prompt is open, on any screen.
+pub const PROMPT_HINTS: &[(&str, &str)] = &[("0-9", "value"), ("j/k", "nudge"), ("enter", "set"), ("esc", "cancel")];
 
 /// Collection name left, optional notice in the middle, screen context right (dim).
 fn status_row(frame: &mut Frame, area: Rect, notice: Option<&str>, context: &str) {
@@ -64,7 +86,9 @@ fn hints_row(frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
             spans.push(Span::from(" · ").dim());
         }
         spans.push(Span::from(*key).fg(AMBER));
-        spans.push(Span::from(format!(" {label}")).dim());
+        if !label.is_empty() {
+            spans.push(Span::from(format!(" {label}")).dim());
+        }
     }
     frame.render_widget(Line::from(spans), area);
 }
@@ -139,6 +163,7 @@ mod tests {
         assert!(body.contains("card"), "{body}");
         assert!(r[23].contains("enter open"), "{:?}", r[23]);
         assert!(r[23].contains("q quit"), "{:?}", r[23]);
+        assert_eq!(r[23], "j/k move · enter open · p prio · tab review · q quit", "p is a queue key (M2)");
         assert!(!r.iter().any(|l| l.contains('│') || l.contains('┌')), "no borders");
     }
 
@@ -244,6 +269,87 @@ mod tests {
         }
     }
 
+    fn open_article(app: &mut App) {
+        let idx = app.items.iter().position(|i| i.path == "citrus-vocab.md").unwrap();
+        app.queue_sel = idx;
+        app.handle_key(KeyCode::Enter).unwrap();
+    }
+
+    /// Modifiers of the cell that holds the first character of `needle` on screen.
+    fn cell_mods(app: &App, needle: &str) -> ratatui::style::Modifier {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ")).collect();
+            if let Some(col) = row.find(needle) {
+                let x = row[..col].chars().count() as u16;
+                return buf.cell((x, y)).unwrap().modifier;
+            }
+        }
+        panic!("{needle:?} not on screen");
+    }
+
+    #[test]
+    fn read_screen_shows_paragraphs_with_gutter_dim_marks_selection_and_hints() {
+        use ratatui::style::Modifier;
+        let (_d, mut app) = fixture_app();
+        open_article(&mut app);
+        let r = rows(&app);
+        assert!(r[0].ends_with("read · prio 20 · ¶ 3/4 · 3 harvested"), "{:?}", r[0]);
+        let all = r.join("\n");
+        assert!(all.contains("# Citrus vocabulary"), "raw markdown: {all}");
+        assert!(all.contains("▸ Pomelo is the largest"), "gutter mark on the current paragraph: {all}");
+        assert!(!all.contains("▸ # Citrus"), "{all}");
+        assert_eq!(r[23], "j/k ¶ · w/b word · v mark · ^x extract · ^z cloze · enter next · d done · p prio");
+        assert!(cell_mods(&app, "Pomelo is").contains(Modifier::DIM), "harvested span is dim");
+        assert!(!cell_mods(&app, "A long-form").contains(Modifier::DIM), "unharvested text is not");
+        assert!(cell_mods(&app, "Pomelo is").contains(Modifier::UNDERLINED), "word under the cursor");
+
+        app.handle_key(KeyCode::Char('v')).unwrap();
+        app.handle_key(KeyCode::Char('w')).unwrap();
+        let r = rows(&app);
+        assert!(r[0].contains("selecting 2 words"), "{:?}", r[0]);
+        assert_eq!(r[23], "w/b · j/k extend · ^x extract · ^z cloze · esc cancel");
+        assert!(cell_mods(&app, "Pomelo is").contains(Modifier::REVERSED));
+        assert!(!cell_mods(&app, "the largest").contains(Modifier::REVERSED));
+
+        app.handle_key(KeyCode::Esc).unwrap();
+        app.handle_key(KeyCode::Char('p')).unwrap();
+        let r = rows(&app);
+        assert!(r[0].contains("prio 20 › 20"), "{:?}", r[0]);
+        assert_eq!(r[23], "0-9 value · j/k nudge · enter set · esc cancel");
+        assert!(!r.iter().any(|l| l.contains('│') || l.contains('┌')), "no borders");
+    }
+
+    #[test]
+    fn read_screen_keeps_the_cursor_paragraph_visible_and_wraps_long_lines() {
+        let (dir, _first) = fixture_app();
+        let long = (1..=30).map(|i| format!("Paragraph {i} {}", "word ".repeat(30))).collect::<Vec<_>>().join("\n\n");
+        std::fs::write(dir.path().join("long.md"), format!("---\ntype: article\nsm_id: 77\nprio: 1\n---\n{long}\n")).unwrap();
+        let mut app = App::open(dir.path(), NaiveDate::from_ymd_opt(2026, 9, 20).unwrap()).unwrap();
+        let idx = app.items.iter().position(|i| i.path == "long.md").unwrap();
+        app.queue_sel = idx;
+        app.handle_key(KeyCode::Enter).unwrap();
+        for _ in 0..29 {
+            app.handle_key(KeyCode::Char('j')).unwrap();
+        }
+        let r = rows(&app);
+        assert!(r.iter().any(|l| l.starts_with("▸ Paragraph 30")), "last paragraph on screen: {r:?}");
+        assert!(r.iter().all(|l| l.chars().count() <= 80), "wrapped");
+        assert!(r.iter().filter(|l| l.contains("word word")).count() > 3, "several wrapped rows: {r:?}");
+        drop(app);
+    }
+
+    #[test]
+    fn queue_shows_article_due_like_cards() {
+        let (_d, app) = fixture_app();
+        let r = rows(&app);
+        let earl = r.iter().find(|l| l.contains("Earl Grey")).unwrap();
+        assert!(earl.contains("now"), "{earl}");
+        assert!(!earl.contains('—'), "{earl}");
+    }
+
     #[test]
     fn renders_at_narrow_sizes_without_panicking() {
         let (_d, mut app) = fixture_app();
@@ -254,6 +360,14 @@ mod tests {
         app.handle_key(KeyCode::Tab).unwrap();
         app.handle_key(KeyCode::Char(' ')).unwrap();
         for (w, h) in [(20u16, 3u16), (1, 1), (0, 0), (40, 2)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| render(f, &app)).unwrap();
+        }
+        app.handle_key(KeyCode::Tab).unwrap();
+        open_article(&mut app);
+        app.handle_key(KeyCode::Char('v')).unwrap();
+        app.handle_key(KeyCode::Char('p')).unwrap();
+        for (w, h) in [(20u16, 3u16), (1, 1), (0, 0), (40, 2), (3, 30)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             terminal.draw(|f| render(f, &app)).unwrap();
         }

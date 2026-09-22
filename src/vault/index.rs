@@ -4,8 +4,10 @@
 //! (allocating and writing back missing sm_ids), then drop rows for files that
 //! no longer exist. A rename shows up as a known sm_id at a new path.
 //!
-//! This module is the only writer of vault files, and it writes two things:
-//! a missing `sm_id` on first index, and `due`/`interval` after a sync.
+//! This module is the only writer of vault files. It writes a missing `sm_id` on
+//! first index (M0), `due`/`interval` after a sync (M1), and, from M2, an
+//! article's session keys (`read_pos`, `due`, `interval`, `done`, `prio`) and new
+//! child files under a folder named after their parent.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -14,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 
 use crate::db::{Db, ItemRow};
+use crate::vault::article::Span;
 use crate::vault::card::{parse_card_body, CardBody};
 use crate::vault::frontmatter::{Document, ItemMeta, ItemType};
 use crate::vault::scan::{mtime_of, scan_vault, ScannedFile};
@@ -124,8 +127,25 @@ fn index_file(
         tags: meta.tags.join(","),
         mtime,
         title,
+        a_factor: meta.a_factor,
+        done: meta.done,
+        source: meta.source.as_deref().and_then(link_target),
+        range: meta
+            .range
+            .as_deref()
+            .and_then(Span::parse_range)
+            .map(|r| (r.start as i64, r.end as i64)),
     })?;
     Ok(allocated)
+}
+
+/// The path a `source` wikilink points at: `[[citrus-vocab|alias]]` → `citrus-vocab`,
+/// `[[citrus-vocab/1.md]]` → `citrus-vocab/1`. `None` when empty.
+pub fn link_target(source: &str) -> Option<String> {
+    let inner = source.trim().trim_start_matches("[[").trim_end_matches("]]");
+    let name = inner.split('|').next().unwrap_or_default().trim();
+    let name = name.strip_suffix(".md").unwrap_or(name);
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn allocate_unseen(db: &Db, seen_ids: &HashSet<i64>) -> Result<i64> {
@@ -147,6 +167,101 @@ pub fn write_schedule(root: &Path, rel_path: &str, due: NaiveDate, interval: i64
     let out = doc.serialize().with_context(|| format!("serializing {rel_path}"))?;
     std::fs::write(&abs, out).with_context(|| format!("writing schedule to {rel_path}"))?;
     mtime_of(&abs)
+}
+
+/// Rewrite one file's frontmatter through `Document` and return the new mtime.
+fn rewrite(root: &Path, rel_path: &str, edit: impl FnOnce(&mut Document)) -> Result<i64> {
+    let abs = root.join(rel_path);
+    let text = std::fs::read_to_string(&abs).with_context(|| format!("reading {rel_path}"))?;
+    let mut doc = Document::parse(&text).with_context(|| format!("parsing {rel_path}"))?;
+    edit(&mut doc);
+    let out = doc.serialize().with_context(|| format!("serializing {rel_path}"))?;
+    std::fs::write(&abs, out).with_context(|| format!("writing {rel_path}"))?;
+    mtime_of(&abs)
+}
+
+/// After a reading session: `read_pos`, `due` and `interval` in one rewrite.
+pub fn write_article_session(root: &Path, rel_path: &str, read_pos: i64, due: NaiveDate, interval: i64) -> Result<i64> {
+    rewrite(root, rel_path, |doc| {
+        doc.set_read_pos(read_pos);
+        doc.set_schedule(due, interval);
+    })
+}
+
+pub fn write_read_pos(root: &Path, rel_path: &str, read_pos: i64) -> Result<i64> {
+    rewrite(root, rel_path, |doc| doc.set_read_pos(read_pos))
+}
+
+pub fn write_prio(root: &Path, rel_path: &str, prio: i64) -> Result<i64> {
+    rewrite(root, rel_path, |doc| doc.set_prio(prio))
+}
+
+pub fn write_done(root: &Path, rel_path: &str, done: NaiveDate) -> Result<i64> {
+    rewrite(root, rel_path, |doc| doc.set_done(done))
+}
+
+/// Create a child of `parent` (an extract when `kind` is an article, a cloze when it
+/// is a card) at `<parent stem>/<n>.md`, index it, and return its row. The parent
+/// file is not touched. `body` is the whole body text; `range` the span of the
+/// parent body it came from. `prio` is inherited; an extract also inherits an
+/// explicit `a_factor`.
+pub fn create_child(root: &Path, db: &Db, parent: &ItemRow, kind: ItemType, body: &str, range: Span) -> Result<ItemRow> {
+    let stem = parent.path.strip_suffix(".md").unwrap_or(&parent.path);
+    let dir = root.join(stem);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {stem}/"))?;
+    let n = next_child_number(&dir)?;
+    let rel_path = format!("{stem}/{n}.md");
+    let sm_id = db.allocate_sm_id()?;
+
+    let mut doc = Document {
+        front: serde_yaml::Mapping::new(),
+        body: if body.ends_with('\n') { body.to_string() } else { format!("{body}\n") },
+    };
+    doc.front.insert(serde_yaml::Value::from("type"), serde_yaml::Value::from(kind.as_str()));
+    doc.set_sm_id(sm_id);
+    doc.set_prio(parent.prio);
+    if kind == ItemType::Article {
+        if let Some(a) = parent.a_factor {
+            doc.set_a_factor(a);
+        }
+    }
+    doc.set_source_range(stem, &range.range_string());
+    let out = doc.serialize().with_context(|| format!("serializing {rel_path}"))?;
+    std::fs::write(root.join(&rel_path), out).with_context(|| format!("writing {rel_path}"))?;
+    index_path(root, db, &rel_path)
+}
+
+/// Highest `<n>.md` in `dir` plus one; 1 for an empty folder. Other names are ignored.
+fn next_child_number(dir: &Path) -> Result<u32> {
+    let mut max = 0u32;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if let Some(n) = name.strip_suffix(".md").and_then(|s| s.parse::<u32>().ok()) {
+            max = max.max(n);
+        }
+    }
+    Ok(max + 1)
+}
+
+/// Index one file grain just wrote, and return its row.
+fn index_path(root: &Path, db: &Db, rel_path: &str) -> Result<ItemRow> {
+    let abs_path = root.join(rel_path);
+    let file = ScannedFile {
+        rel_path: rel_path.to_string(),
+        mtime: mtime_of(&abs_path)?,
+        abs_path,
+    };
+    let known = db.path_index()?;
+    let mut seen_ids: HashSet<i64> = known.values().map(|(id, _)| *id).collect();
+    let mut claimed_ids = HashSet::new();
+    index_file(db, &file, &mut seen_ids, &mut claimed_ids).with_context(|| format!("indexing {rel_path}"))?;
+    let sm_id = *db
+        .path_index()?
+        .get(rel_path)
+        .map(|(id, _)| id)
+        .with_context(|| format!("{rel_path} was not indexed"))?;
+    db.item(sm_id)?.with_context(|| format!("{rel_path} vanished from the index"))
 }
 
 /// Read and parse a card by its vault-relative path.
@@ -343,6 +458,110 @@ mod tests {
         let due = chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
         let err = write_schedule(dir.path(), "nope.md", due, 1).unwrap_err().to_string();
         assert!(err.contains("nope.md"), "{err}");
+    }
+
+    // ---- M2 writers ----
+
+    use crate::vault::article::Span;
+
+    fn article_setup() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "a.md",
+            "---\ntype: article\nsm_id: 10\nprio: 30\na_factor: 2\ncustom: keep\n---\n# Title\n\nPomelo is the largest citrus fruit.\nKumquat is small.\n",
+        );
+        write(root, "b.md", "---\ntype: article\nprio: 40\n---\nplain\n");
+        let db = Db::open(&root.join(".grain/grain.db")).unwrap();
+        refresh(root, &db).unwrap();
+        (dir, db)
+    }
+
+    fn d(s: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn article_writers_rewrite_the_file_keep_unknown_keys_and_return_the_new_mtime() {
+        let (dir, db) = article_setup();
+        let root = dir.path();
+        let m1 = write_article_session(root, "a.md", 10, d("2026-09-29"), 7).unwrap();
+        let text = fs::read_to_string(root.join("a.md")).unwrap();
+        assert!(text.starts_with("---\ntype: article\nsm_id: 10\ndue: 2026-09-29\ninterval: 7\nprio: 30\nread_pos: 10\na_factor: 2\ncustom: keep\n---\n# Title\n"), "{text}");
+        assert_eq!(m1, mtime_of(&root.join("a.md")).unwrap());
+        let _ = write_read_pos(root, "a.md", 36).unwrap();
+        assert!(fs::read_to_string(root.join("a.md")).unwrap().contains("\nread_pos: 36\n"));
+        let _ = write_prio(root, "a.md", 25).unwrap();
+        assert!(fs::read_to_string(root.join("a.md")).unwrap().contains("\nprio: 25\nread_pos: 36\n"));
+        let m2 = write_done(root, "a.md", d("2026-09-30")).unwrap();
+        let text = fs::read_to_string(root.join("a.md")).unwrap();
+        assert!(text.contains("\na_factor: 2\ndone: 2026-09-30\ncustom: keep\n"), "{text}");
+        assert!(text.ends_with("Kumquat is small.\n"), "body intact");
+        // Recording the mtime in the index makes the next refresh skip the file.
+        db.set_done(10, d("2026-09-30"), m2).unwrap();
+        let report = refresh(root, &db).unwrap();
+        assert_eq!(report.indexed, 0, "{report:?}");
+        assert!(write_prio(root, "nope.md", 1).unwrap_err().to_string().contains("nope.md"));
+    }
+
+    #[test]
+    fn create_child_makes_a_numbered_file_in_a_folder_named_after_the_parent() {
+        let (dir, db) = article_setup();
+        let root = dir.path();
+        let parent = db.item(10).unwrap().unwrap();
+        let body = "Pomelo is the largest citrus fruit.\n";
+        let child = create_child(root, &db, &parent, ItemType::Article, body, Span { start: 9, end: 44 }).unwrap();
+        assert_eq!(child.path, "a/1.md");
+        assert_eq!(child.kind, ItemType::Article);
+        assert_eq!(child.prio, 30);
+        assert_eq!(child.a_factor, Some(2.0));
+        assert_eq!(child.source.as_deref(), Some("a"));
+        assert_eq!(child.range, Some((9, 44)));
+        assert!(child.sm_id > 0 && child.sm_id != 10);
+        let text = fs::read_to_string(root.join("a/1.md")).unwrap();
+        assert_eq!(
+            text,
+            format!("---\ntype: article\nsm_id: {}\nprio: 30\na_factor: 2\nsource: '[[a]]'\nrange: 9-44\n---\nPomelo is the largest citrus fruit.\n", child.sm_id)
+        );
+        assert_eq!(db.item(child.sm_id).unwrap().unwrap(), child, "indexed at once");
+        assert_eq!(db.children_of("a").unwrap().len(), 1);
+        assert_eq!(fs::read_to_string(root.join("a.md")).unwrap().matches("Pomelo").count(), 1, "parent untouched");
+
+        // Numbering skips non-numeric names and continues from the highest number.
+        write(root, "a/notes.md", "---\ntype: article\n---\nx\n");
+        let second = create_child(root, &db, &parent, ItemType::Article, "Kumquat is small.\n", Span { start: 45, end: 62 }).unwrap();
+        assert_eq!(second.path, "a/2.md");
+
+        // A cloze child is a card, without a_factor, and is due now.
+        let q = "Q: [...] is the largest citrus fruit.\n\nA: Pomelo\n";
+        let cloze = create_child(root, &db, &parent, ItemType::Card, q, Span { start: 9, end: 15 }).unwrap();
+        assert_eq!(cloze.path, "a/3.md");
+        assert_eq!(cloze.kind, ItemType::Card);
+        assert_eq!(cloze.a_factor, None);
+        assert_eq!(cloze.due, None);
+        assert_eq!(cloze.title.as_deref(), Some("[...] is the largest citrus fruit."));
+        let text = fs::read_to_string(root.join("a/3.md")).unwrap();
+        assert!(text.starts_with(&format!("---\ntype: card\nsm_id: {}\nprio: 30\nsource: '[[a]]'\nrange: 9-15\n---\nQ: [...]", cloze.sm_id)), "{text}");
+
+        // Nested: a child of a child goes one folder deeper, with a path-qualified link.
+        let grandchild = create_child(root, &db, &child, ItemType::Article, "Pomelo\n", Span { start: 0, end: 6 }).unwrap();
+        assert_eq!(grandchild.path, "a/1/1.md");
+        assert_eq!(grandchild.source.as_deref(), Some("a/1"));
+        assert!(fs::read_to_string(root.join("a/1/1.md")).unwrap().contains("source: '[[a/1]]'"));
+
+        // A parent without an explicit a_factor passes none on.
+        let b = db.queue().unwrap().into_iter().find(|i| i.path == "b.md").unwrap();
+        let bc = create_child(root, &db, &b, ItemType::Article, "plain\n", Span { start: 0, end: 5 }).unwrap();
+        assert_eq!(bc.path, "b/1.md");
+        assert_eq!(bc.a_factor, None);
+
+        // The next refresh sees every child as unchanged and allocates nothing.
+        let report = refresh(root, &db).unwrap();
+        assert_eq!(report.indexed, 1, "only notes.md was new to the index: {report:?}");
+        assert_eq!(report.allocated, 1, "notes.md had no sm_id; every child already had one");
+        assert_eq!(report.unchanged, 7, "children are skipped by mtime: {report:?}");
+        assert_eq!(db.queue().unwrap().len(), 8);
     }
 
     #[test]

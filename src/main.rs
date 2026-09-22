@@ -98,7 +98,7 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if event::poll(TICK)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    app.handle_key(key.code)?;
+                    app.handle_key_with(key.code, key.modifiers)?;
                 }
             }
         }
