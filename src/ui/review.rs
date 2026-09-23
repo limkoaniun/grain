@@ -32,50 +32,75 @@ pub const DONE_HINTS: &[(&str, &str)] = &[("tab", "queue"), ("q", "quit")];
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     if app.review.phase == Phase::DrillPrompt {
-        super::centered_note(frame, area, &app.drill_prompt());
+        let keys = Line::from(vec![
+            Span::from("y").fg(super::AMBER),
+            Span::from(" drill").dim(),
+            Span::from("        "),
+            Span::from("n").fg(super::AMBER),
+            Span::from(" finish").dim(),
+        ]);
+        super::note_box(
+            frame,
+            area,
+            &[Line::from(app.drill_prompt()), Line::default(), keys],
+            None,
+        );
         return;
     }
     let Some(cur) = &app.review.current else {
-        let msg = match &app.review.status {
-            Some(status) => format!("{} · {status}", app.finish_line()),
-            None => app.finish_line(),
+        // `nothing more to learn · 4 graded · 2 read` becomes a bold title over dim counts.
+        let finish = app.finish_line();
+        let (title, counts) = match finish.split_once(" · ") {
+            Some((title, counts)) => (title.to_string(), counts.to_string()),
+            None => (finish, String::new()),
         };
-        super::centered_note(frame, area, &msg);
+        super::note_box(
+            frame,
+            area,
+            &[Line::from(title).bold(), Line::from(counts).dim()],
+            app.review.status.as_deref(),
+        );
         return;
     };
 
-    let [q_area, ref_area, _gap, a_area, grade_area, status_area] = area.layout(&Layout::vertical([
+    // Two columns of breathing room on the left; the card is the only screen that indents.
+    let area = Rect { x: area.x + 2, width: area.width.saturating_sub(2), ..area };
+    let [q_area, gap_area, a_area, grade_area, status_area] = area.layout(&Layout::vertical([
         Constraint::Fill(3),
-        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Fill(2),
         Constraint::Length(1),
         Constraint::Length(1),
     ]));
 
-    frame.render_widget(paragraph(&cur.card.body.question), q_area);
-    if let Some(line) = reference_line(&cur.card.meta) {
-        frame.render_widget(line, ref_area);
-    }
+    // The reference line is the question's last line, so it hugs the text instead of
+    // floating at the bottom of the question area.
+    let mut question = lines(&cur.card.body.question);
+    question.extend(reference_line(&cur.card.meta));
+    frame.render_widget(Paragraph::new(question).wrap(Wrap { trim: false }), q_area);
     if app.review.revealed {
+        frame.render_widget(Line::from("─ ─ ─").dim(), gap_area);
         frame.render_widget(paragraph(&cur.card.body.answer), a_area);
         frame.render_widget(grade_row(), grade_area);
     }
     if let Some(status) = &app.review.status {
-        frame.render_widget(Line::from(status.as_str()).dim(), status_area);
+        frame.render_widget(Line::from(status.as_str()).dim().right_aligned(), status_area);
     }
 }
 
 /// Bare text lines; embeds become dim placeholders such as `[image: pomelo.png]`.
-fn paragraph(segments: &[Segment]) -> Paragraph<'_> {
-    let lines: Vec<Line> = segments
+fn lines(segments: &[Segment]) -> Vec<Line<'_>> {
+    segments
         .iter()
         .map(|s| match s {
             Segment::Text(t) => Line::from(t.as_str()),
             Segment::Embed(e) => Line::from(e.placeholder()).dim(),
         })
-        .collect();
-    Paragraph::new(lines).wrap(Wrap { trim: false })
+        .collect()
+}
+
+fn paragraph(segments: &[Segment]) -> Paragraph<'_> {
+    Paragraph::new(lines(segments)).wrap(Wrap { trim: false })
 }
 
 /// `↳ citrus-vocab.md › 2210-2380` (blue, dim) when the card has a `source`.
@@ -104,11 +129,23 @@ fn reference_line(meta: &ItemMeta) -> Option<Line<'static>> {
     Some(Line::from(text).style(Style::new().fg(Color::Blue).dim()))
 }
 
-/// `[0 null] [1 bad] [2 fail]   [3 pass] [4 good] [5 bright]`, red-ish then green-ish.
+/// `0 null   1 bad   2 fail   │   3 pass   4 good   5 bright`: amber digits, the
+/// failing half red-ish and the passing half green-ish, split by a dim bar.
 fn grade_row() -> Line<'static> {
-    Line::from(vec![
-        Span::from("[0 null] [1 bad] [2 fail]").fg(Color::LightRed),
-        Span::from("   "),
-        Span::from("[3 pass] [4 good] [5 bright]").fg(Color::LightGreen),
-    ])
+    let mut spans = Vec::with_capacity(17);
+    for (i, (key, label)) in
+        [("0", " null"), ("1", " bad"), ("2", " fail"), ("3", " pass"), ("4", " good"), ("5", " bright")]
+            .into_iter()
+            .enumerate()
+    {
+        match i {
+            0 => {}
+            3 => spans.push(Span::from("   │   ").dim()),
+            _ => spans.push(Span::from("   ")),
+        }
+        spans.push(Span::from(key).fg(super::AMBER));
+        let half = if i < 3 { Color::LightRed } else { Color::LightGreen };
+        spans.push(Span::from(label).fg(half));
+    }
+    Line::from(spans)
 }

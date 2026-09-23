@@ -36,8 +36,9 @@ advice; ignore its stack and styling advice where it conflicts with this repo:
 
 - anyhow, not color-eyre; edition 2021, not 2024
 - no tokio, clap, tracing, textwrap or tui-shimmer until a milestone needs them
-- no blocks, borders, shadows or cyan palette — the three-row chromeless layout
-  and amber hints in `context/coding-standards.md` win
+- no bordered panels, titles, shadows or cyan palette — the three-region layout
+  (status, rule, content, rule, hints), the amber accent and the single rounded
+  note box in `context/coding-standards.md` win
 - its project templates are for greenfield apps; grain already has its shape
 
 ## Commands

@@ -1,9 +1,12 @@
-//! Read screen: the article body as wrapped raw markdown, a gutter mark on the
-//! current paragraph, harvested spans dim, the selection reversed, the cursor
-//! word underlined. Scrolls by whole paragraphs to keep the cursor visible.
+//! Read screen: the article body as wrapped raw markdown, an amber gutter bar on
+//! the current paragraph and a dim dot on harvested ones, other paragraphs dim,
+//! `#` lines bold, harvested spans dim, the selection reversed, the cursor word
+//! underlined. Scrolls by whole paragraphs to keep the cursor visible.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Style, Stylize};
+// `Style`'s modifier helpers (`dim`, `reversed`, `underlined`) are inherent, so
+// `Stylize` is no longer needed here.
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
@@ -39,7 +42,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
     if read.paragraphs.is_empty() {
-        super::centered_note(frame, area, "article is empty · tab back to queue");
+        super::note_box(frame, area, &[Line::from("article is empty · tab back to queue")], None);
         return;
     }
     if area.width <= GUTTER || area.height == 0 {
@@ -103,14 +106,32 @@ fn paragraph_lines<'a>(read: &'a Read, i: usize, marks: &Marks) -> Vec<Line<'a>>
     let Some(p) = read.paragraphs.get(i) else {
         return Vec::new();
     };
+    let current = i == read.cursor;
+    let harvested = marks.children.iter().any(|c| c.start <= p.start && p.start < c.end);
     let text = p.text(&read.body);
     let mut out = Vec::new();
     let mut off = p.start;
     for (n, line) in text.split('\n').enumerate() {
         let mut spans: Vec<Span> = Vec::with_capacity(4);
-        let gutter = if n == 0 && i == read.cursor { "▸ " } else { "  " };
-        spans.push(Span::from(gutter).fg(super::AMBER));
-        spans.extend(styled_runs(line, off, marks));
+        // Two cells on every line, so `wrapped_rows` keeps its estimate.
+        let (gutter, gutter_style) = if current {
+            ("▎ ", Style::new().fg(super::AMBER))
+        } else if n == 0 && harvested {
+            ("• ", Style::new().dim())
+        } else {
+            ("  ", Style::new())
+        };
+        spans.push(Span::styled(gutter, gutter_style));
+        let heading = line.trim_start().starts_with('#');
+        spans.extend(styled_runs(line, off, marks).into_iter().map(|mut span| {
+            if !current {
+                span.style = span.style.add_modifier(Modifier::DIM);
+            }
+            if heading {
+                span.style = span.style.add_modifier(Modifier::BOLD);
+            }
+            span
+        }));
         out.push(Line::from(spans));
         off += line.chars().count() + 1;
     }
