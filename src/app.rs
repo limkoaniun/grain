@@ -684,8 +684,8 @@ impl App {
             (KeyCode::Char('z'), true) => self.cloze()?,
             (KeyCode::Char('j') | KeyCode::Down, false) => self.with_read(|r| r.move_paragraph(1)),
             (KeyCode::Char('k') | KeyCode::Up, false) => self.with_read(|r| r.move_paragraph(-1)),
-            (KeyCode::Char('w'), false) => self.with_read(|r| r.move_word(1)),
-            (KeyCode::Char('b'), false) => self.with_read(|r| r.move_word(-1)),
+            (KeyCode::Char('w' | 'l') | KeyCode::Right, false) => self.with_read(|r| r.move_word(1)),
+            (KeyCode::Char('b' | 'h') | KeyCode::Left, false) => self.with_read(|r| r.move_word(-1)),
             (KeyCode::Char('v'), false) => self.with_read(|r| {
                 if !r.words.is_empty() {
                     r.selection = Some(Selection::Words { anchor: r.word });
@@ -1743,6 +1743,25 @@ mod tests {
         assert!(text.contains("range: 21-205\n---\nA long-form note on citrus species and their culinary names.\n\nPomelo is the largest"), "{text}");
         assert!(text.ends_with("sour flesh.\n"), "{text}");
         assert_eq!(app.items.len(), 10);
+    }
+
+    #[test]
+    fn h_l_and_the_side_arrows_move_the_word_cursor_like_b_and_w() {
+        let (_d, mut app) = fixture_app();
+        open_article(&mut app, "citrus-vocab.md");
+        assert_eq!((read(&app).cursor, read(&app).word), (2, 0));
+        press(&mut app, 'l');
+        press(&mut app, 'l');
+        assert_eq!(read(&app).word, 2, "l moves to the next word like w");
+        press(&mut app, 'h');
+        assert_eq!(read(&app).word, 1, "h moves to the previous word like b");
+        app.handle_key(KeyCode::Right).unwrap();
+        assert_eq!(read(&app).word, 2, "right arrow like w");
+        app.handle_key(KeyCode::Left).unwrap();
+        app.handle_key(KeyCode::Left).unwrap();
+        app.handle_key(KeyCode::Left).unwrap();
+        assert_eq!(read(&app).word, 0, "left arrow like b, clamped at the first word");
+        assert_eq!(read(&app).cursor, 2, "h/l never change the paragraph");
     }
 
     #[test]
