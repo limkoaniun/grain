@@ -1,7 +1,9 @@
 //! SQLite sidecar at `<vault>/.grain/grain.db`.
 //!
 //! A rebuildable cache of the vault plus the grade journal. All writes go
-//! through one [`Db`] on one thread. Schema is versioned via `meta.schema_version`.
+//! through one [`Db`] on one thread. Schema is versioned via `meta.schema_version`:
+//! 1 is M0/M1, 2 (M2) adds article scheduling and the child link, 3 (M5) adds
+//! `items.url` and `items.imported`. Each step runs once, in its own transaction.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -12,7 +14,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::vault::frontmatter::ItemType;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS items (
@@ -59,6 +61,16 @@ UPDATE items SET mtime = 0;
 UPDATE meta SET value = '2' WHERE key = 'schema_version';
 ";
 
+/// Version 2 → 3 (M5): where an imported item came from and when. The `mtime`
+/// reset makes the next refresh re-index every file once so the new columns fill.
+const MIGRATE_V3: &str = "
+ALTER TABLE items ADD COLUMN url      TEXT;
+ALTER TABLE items ADD COLUMN imported TEXT;
+CREATE INDEX idx_url ON items(url);
+UPDATE items SET mtime = 0;
+UPDATE meta SET value = '3' WHERE key = 'schema_version';
+";
+
 /// One row of `items`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ItemRow {
@@ -80,6 +92,10 @@ pub struct ItemRow {
     pub source: Option<String>,
     /// M2: `range` as `(start, end)` character offsets into the parent body.
     pub range: Option<(i64, i64)>,
+    /// M5: the address an imported article came from; `None` when it was not imported.
+    pub url: Option<String>,
+    /// M5: the date the item was imported; `None` when it was not imported.
+    pub imported: Option<NaiveDate>,
 }
 
 /// One unsynced journal row, ready to be sent to the scheduler.
@@ -151,6 +167,12 @@ impl Db {
             tx.commit()?;
             version = 2;
         }
+        if version == 2 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(MIGRATE_V3).context("migrating grain.db to schema version 3")?;
+            tx.commit()?;
+            version = 3;
+        }
         debug_assert_eq!(version, SCHEMA_VERSION);
         if self.meta("next_sm_id")?.is_none() {
             self.set_meta("next_sm_id", "1")?;
@@ -218,14 +240,15 @@ impl Db {
     pub fn upsert_item(&self, item: &ItemRow) -> Result<()> {
         self.conn.execute(
             "INSERT INTO items (sm_id, path, type, due, interval, prio, read_pos, tags, mtime, title,
-                                a_factor, done, source, range_start, range_end)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                                a_factor, done, source, range_start, range_end, url, imported)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(sm_id) DO UPDATE SET
                path = excluded.path, type = excluded.type, due = excluded.due,
                interval = excluded.interval, prio = excluded.prio, read_pos = excluded.read_pos,
                tags = excluded.tags, mtime = excluded.mtime, title = excluded.title,
                a_factor = excluded.a_factor, done = excluded.done, source = excluded.source,
-               range_start = excluded.range_start, range_end = excluded.range_end",
+               range_start = excluded.range_start, range_end = excluded.range_end,
+               url = excluded.url, imported = excluded.imported",
             params![
                 item.sm_id,
                 item.path,
@@ -242,6 +265,8 @@ impl Db {
                 item.source,
                 item.range.map(|r| r.0),
                 item.range.map(|r| r.1),
+                item.url,
+                item.imported.map(|d| d.to_string()),
             ],
         )
         .with_context(|| format!("indexing {}", item.path))?;
@@ -332,10 +357,15 @@ impl Db {
         Ok(self.select_items("WHERE sm_id = ?1", &[&sm_id])?.into_iter().next())
     }
 
+    /// M5: the item imported from `url`, if the vault already holds one.
+    pub fn item_by_url(&self, url: &str) -> Result<Option<ItemRow>> {
+        Ok(self.select_items("WHERE url = ?1 LIMIT 1", &[&url])?.into_iter().next())
+    }
+
     fn select_items(&self, tail: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<ItemRow>> {
         let sql = format!(
             "SELECT sm_id, path, type, due, interval, prio, read_pos, tags, mtime, title,
-                    a_factor, done, source, range_start, range_end
+                    a_factor, done, source, range_start, range_end, url, imported
              FROM items {tail}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -356,6 +386,8 @@ impl Db {
                 source: r.get(12)?,
                 range_start: r.get(13)?,
                 range_end: r.get(14)?,
+                url: r.get(15)?,
+                imported: r.get(16)?,
             })
         })?;
         rows.map(|r| r?.into_row()).collect()
@@ -473,6 +505,8 @@ struct RawItem {
     source: Option<String>,
     range_start: Option<i64>,
     range_end: Option<i64>,
+    url: Option<String>,
+    imported: Option<String>,
 }
 
 impl RawItem {
@@ -487,6 +521,7 @@ impl RawItem {
         };
         let due = date("due", self.due)?;
         let done = date("done", self.done)?;
+        let imported = date("imported", self.imported)?;
         let range = match (self.range_start, self.range_end) {
             (Some(a), Some(b)) => Some((a, b)),
             _ => None,
@@ -506,6 +541,8 @@ impl RawItem {
             done,
             source: self.source,
             range,
+            url: self.url,
+            imported,
         })
     }
 }
@@ -538,13 +575,15 @@ mod tests {
             done: None,
             source: None,
             range: None,
+            url: None,
+            imported: None,
         }
     }
 
     #[test]
     fn fresh_db_has_schema_version_and_next_sm_id() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("2"));
+        assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("3"));
         assert_eq!(db.meta("next_sm_id").unwrap().as_deref(), Some("1"));
     }
 
@@ -731,13 +770,13 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_migrates_to_v2_in_place_keeping_rows_and_forcing_a_reindex() {
+    fn v1_database_migrates_to_current_in_place_keeping_rows_and_forcing_a_reindex() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grain.db");
         v1_database(&path);
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("2"));
-        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("3"));
+        assert_eq!(SCHEMA_VERSION, 3);
         let items = db.queue().unwrap();
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|i| i.mtime == 0), "mtime zeroed so the next refresh re-indexes: {items:?}");
@@ -746,18 +785,65 @@ mod tests {
         assert_eq!(db.meta("next_sm_id").unwrap().as_deref(), Some("3"));
         drop(db);
         let again = Db::open(&path).unwrap();
-        assert_eq!(again.meta("schema_version").unwrap().as_deref(), Some("2"), "idempotent");
-        let cols: Vec<String> = again
-            .conn
+        assert_eq!(again.meta("schema_version").unwrap().as_deref(), Some("3"), "idempotent");
+        let cols = item_columns(&again);
+        for c in ["a_factor", "done", "source", "range_start", "range_end"] {
+            assert!(cols.iter().any(|x| x == c), "missing column {c}: {cols:?}");
+        }
+    }
+
+    fn item_columns(db: &Db) -> Vec<String> {
+        db.conn
             .prepare("PRAGMA table_info(items)")
             .unwrap()
             .query_map([], |r| r.get::<_, String>(1))
             .unwrap()
             .collect::<std::result::Result<_, _>>()
-            .unwrap();
-        for c in ["a_factor", "done", "source", "range_start", "range_end"] {
+            .unwrap()
+    }
+
+    /// A schema-version-2 database with one row, as M2–M4 would have left it.
+    fn v2_database(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '1'), ('next_sm_id', '3')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATE_V2).unwrap();
+        conn.execute(
+            "INSERT INTO items (sm_id, path, type, due, interval, prio, read_pos, tags, mtime, title)
+             VALUES (1, 'a.md', 'card', '2026-09-25', 6, 28, NULL, '', 5, 'a')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v2_database_migrates_to_3_and_zeroes_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grain.db");
+        v2_database(&path);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some("3"));
+        let cols = item_columns(&db);
+        for c in ["url", "imported"] {
             assert!(cols.iter().any(|x| x == c), "missing column {c}: {cols:?}");
         }
+        let item = db.item(1).unwrap().unwrap();
+        assert_eq!(item.mtime, 0, "mtime zeroed so the next refresh re-indexes: {item:?}");
+        assert_eq!(item.url, None);
+        assert_eq!(item.imported, None);
+        assert_eq!(item.due, Some(d("2026-09-25")), "the row survives");
+        let indexes: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_url'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(indexes, 1, "idx_url created");
+        drop(db);
+        let again = Db::open(&path).unwrap();
+        assert_eq!(again.meta("schema_version").unwrap().as_deref(), Some("3"), "idempotent");
     }
 
     #[test]
@@ -838,5 +924,24 @@ mod tests {
         db.set_meta("sync_daily_cap", "lots").unwrap();
         let err = db.meta_i64("sync_daily_cap", 50).unwrap_err().to_string();
         assert!(err.contains("sync_daily_cap"), "{err}");
+    }
+
+    #[test]
+    fn upsert_and_item_round_trip_url_imported() {
+        let db = Db::open_in_memory().unwrap();
+        let mut art = article(1, "imported/a.md", 20, None);
+        art.url = Some("https://x.org/a".to_string());
+        art.imported = Some(d("2026-09-20"));
+        db.upsert_item(&art).unwrap();
+        db.upsert_item(&card(2, "b.md", 50, None)).unwrap();
+
+        let row = db.item(1).unwrap().unwrap();
+        assert_eq!(row.url.as_deref(), Some("https://x.org/a"));
+        assert_eq!(row.imported, Some(d("2026-09-20")));
+        assert_eq!(db.item(2).unwrap().unwrap().url, None);
+
+        let found = db.item_by_url("https://x.org/a").unwrap().unwrap();
+        assert_eq!(found.sm_id, 1);
+        assert!(db.item_by_url("https://x.org/none").unwrap().is_none());
     }
 }

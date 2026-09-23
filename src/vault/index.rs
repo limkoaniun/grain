@@ -7,7 +7,9 @@
 //! This module is the only writer of vault files. It writes a missing `sm_id` on
 //! first index (M0), `due`/`interval` after a sync (M1), and, from M2, an
 //! article's session keys (`read_pos`, `due`, `interval`, `done`, `prio`) and new
-//! child files under a folder named after their parent.
+//! child files under a folder named after their parent. From M5 it also writes
+//! new top-level items (`a`/`i`) and copies a parent's `url`/`imported` onto
+//! extract and cloze children.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -135,6 +137,8 @@ fn index_file(
             .as_deref()
             .and_then(Span::parse_range)
             .map(|r| (r.start as i64, r.end as i64)),
+        url: meta.url.clone(),
+        imported: meta.imported,
     })?;
     Ok(allocated)
 }
@@ -226,9 +230,69 @@ pub fn create_child(root: &Path, db: &Db, parent: &ItemRow, kind: ItemType, body
         }
     }
     doc.set_source_range(stem, &range.range_string());
+    if let Some(u) = &parent.url {
+        doc.set_url(u);
+    }
+    if let Some(d) = parent.imported {
+        doc.set_imported(d);
+    }
     let out = doc.serialize().with_context(|| format!("serializing {rel_path}"))?;
     std::fs::write(root.join(&rel_path), out).with_context(|| format!("writing {rel_path}"))?;
     index_path(root, db, &rel_path)
+}
+
+/// A new top-level item (M5): `a` for a card, `i` for an imported article.
+pub struct NewItem<'a> {
+    pub kind: ItemType,
+    /// Text to slug for the filename; falls back to the kind name when the slug is empty.
+    pub slug_base: &'a str,
+    /// The whole body text (a trailing `\n` is added if missing).
+    pub body: &'a str,
+    /// The address it was imported from, when it was.
+    pub url: Option<&'a str>,
+    /// The date it was imported, when it was.
+    pub imported: Option<NaiveDate>,
+}
+
+/// Write a new top-level file at the first free `<slug>.md`, `<slug>-2.md`, …
+/// (`<kind>.md` when `slug_base` slugs to nothing), index it, and return its row.
+pub fn create_item(root: &Path, db: &Db, item: NewItem<'_>) -> Result<ItemRow> {
+    let slug = crate::import::slug(item.slug_base);
+    let base = if slug.is_empty() { item.kind.as_str().to_string() } else { slug };
+    let rel_path = first_free_name(root, &base);
+    let sm_id = db.allocate_sm_id()?;
+
+    let mut doc = Document {
+        front: serde_yaml::Mapping::new(),
+        body: if item.body.ends_with('\n') { item.body.to_string() } else { format!("{}\n", item.body) },
+    };
+    doc.front.insert(serde_yaml::Value::from("type"), serde_yaml::Value::from(item.kind.as_str()));
+    doc.set_sm_id(sm_id);
+    if let Some(u) = item.url {
+        doc.set_url(u);
+    }
+    if let Some(d) = item.imported {
+        doc.set_imported(d);
+    }
+    let out = doc.serialize().with_context(|| format!("serializing {rel_path}"))?;
+    std::fs::write(root.join(&rel_path), out).with_context(|| format!("writing {rel_path}"))?;
+    index_path(root, db, &rel_path)
+}
+
+/// The first of `<base>.md`, `<base>-2.md`, `<base>-3.md`, … that does not exist yet.
+fn first_free_name(root: &Path, base: &str) -> String {
+    let candidate = format!("{base}.md");
+    if !root.join(&candidate).exists() {
+        return candidate;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}.md");
+        if !root.join(&candidate).exists() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Highest `<n>.md` in `dir` plus one; 1 for an empty folder. Other names are ignored.
@@ -571,5 +635,163 @@ mod tests {
         let card = load_card(dir.path(), "a.md").unwrap();
         assert_eq!(card.meta.sm_id, Some(10));
         assert_eq!(card.body.title().as_deref(), Some("alpha?"));
+    }
+
+    // ---- M5 writers ----
+
+    #[test]
+    fn create_item_writes_card_and_indexes_it() {
+        let (dir, db) = setup();
+        let root = dir.path();
+        let row = create_item(
+            root,
+            &db,
+            NewItem {
+                kind: ItemType::Card,
+                slug_base: "Large citrus fruit?",
+                body: "Q: Large citrus fruit?\n\nA: pomelo\n",
+                url: None,
+                imported: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(row.path, "large-citrus-fruit.md");
+        assert_eq!(row.kind, ItemType::Card);
+        assert_eq!(row.title.as_deref(), Some("Large citrus fruit?"));
+        assert_eq!(row.due, None);
+        assert_eq!(row.prio, 50);
+        let text = fs::read_to_string(root.join("large-citrus-fruit.md")).unwrap();
+        assert_eq!(
+            text,
+            format!("---\ntype: card\nsm_id: {}\n---\nQ: Large citrus fruit?\n\nA: pomelo\n", row.sm_id)
+        );
+    }
+
+    #[test]
+    fn create_item_writes_article_with_reference() {
+        let (dir, db) = setup();
+        let root = dir.path();
+        let row = create_item(
+            root,
+            &db,
+            NewItem {
+                kind: ItemType::Article,
+                slug_base: "Pomelo",
+                body: "# Pomelo\n\nBig.\n",
+                url: Some("https://en.wikipedia.org/wiki/Pomelo"),
+                imported: Some(d("2026-09-20")),
+            },
+        )
+        .unwrap();
+        assert_eq!(row.path, "pomelo.md");
+        let text = fs::read_to_string(root.join("pomelo.md")).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "---\ntype: article\nsm_id: {}\nurl: https://en.wikipedia.org/wiki/Pomelo\nimported: 2026-09-20\n---\n# Pomelo\n\nBig.\n",
+                row.sm_id
+            )
+        );
+        assert_eq!(row.url.as_deref(), Some("https://en.wikipedia.org/wiki/Pomelo"));
+        assert_eq!(row.imported, Some(d("2026-09-20")));
+    }
+
+    #[test]
+    fn create_item_suffixes_on_collision() {
+        let (dir, db) = setup();
+        let root = dir.path();
+        let make = |body: &'static str| NewItem {
+            kind: ItemType::Card,
+            slug_base: "Pomelo",
+            body,
+            url: None,
+            imported: None,
+        };
+        let first = create_item(root, &db, make("Q: a\n\nA: b\n")).unwrap();
+        assert_eq!(first.path, "pomelo.md");
+        let second = create_item(root, &db, make("Q: c\n\nA: d\n")).unwrap();
+        assert_eq!(second.path, "pomelo-2.md");
+        let third = create_item(root, &db, make("Q: e\n\nA: f\n")).unwrap();
+        assert_eq!(third.path, "pomelo-3.md");
+    }
+
+    #[test]
+    fn create_item_falls_back_to_kind_name() {
+        let (dir, db) = setup();
+        let root = dir.path();
+        let card = create_item(
+            root,
+            &db,
+            NewItem {
+                kind: ItemType::Card,
+                slug_base: "柚子",
+                body: "Q: a\n\nA: b\n",
+                url: None,
+                imported: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(card.path, "card.md");
+        let article = create_item(
+            root,
+            &db,
+            NewItem {
+                kind: ItemType::Article,
+                slug_base: "柚子",
+                body: "# T\n",
+                url: None,
+                imported: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(article.path, "article.md");
+    }
+
+    #[test]
+    fn create_child_copies_url_and_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "a.md",
+            "---\ntype: article\nsm_id: 10\nprio: 30\nurl: https://en.wikipedia.org/wiki/Pomelo\nimported: 2026-09-20\n---\n# Title\n\nPomelo is citrus.\n",
+        );
+        let db = Db::open(&root.join(".grain/grain.db")).unwrap();
+        refresh(root, &db).unwrap();
+        let parent = db.item(10).unwrap().unwrap();
+
+        let article_child =
+            create_child(root, &db, &parent, ItemType::Article, "Pomelo is citrus.\n", Span { start: 9, end: 25 }).unwrap();
+        let text = fs::read_to_string(root.join("a/1.md")).unwrap();
+        assert!(
+            text.contains("\nrange: 9-25\nurl: https://en.wikipedia.org/wiki/Pomelo\nimported: 2026-09-20\n"),
+            "{text}"
+        );
+        assert_eq!(article_child.url.as_deref(), Some("https://en.wikipedia.org/wiki/Pomelo"));
+        assert_eq!(article_child.imported, Some(d("2026-09-20")));
+
+        let card_child = create_child(root, &db, &parent, ItemType::Card, "Q: a\n\nA: b\n", Span { start: 0, end: 6 }).unwrap();
+        let text2 = fs::read_to_string(root.join("a/2.md")).unwrap();
+        assert!(
+            text2.contains("\nrange: 0-6\nurl: https://en.wikipedia.org/wiki/Pomelo\nimported: 2026-09-20\n"),
+            "{text2}"
+        );
+        assert_eq!(card_child.url.as_deref(), Some("https://en.wikipedia.org/wiki/Pomelo"));
+        assert_eq!(card_child.imported, Some(d("2026-09-20")));
+    }
+
+    #[test]
+    fn refresh_indexes_url_and_imported() {
+        let (dir, db) = setup();
+        write(
+            dir.path(),
+            "imported.md",
+            "---\ntype: article\nsm_id: 40\nprio: 20\nurl: https://x.org/a\nimported: 2026-09-20\n---\n# Imported\nbody\n",
+        );
+        refresh(dir.path(), &db).unwrap();
+        let row = db.item(40).unwrap().unwrap();
+        assert_eq!(row.url.as_deref(), Some("https://x.org/a"));
+        assert_eq!(row.imported, NaiveDate::from_ymd_opt(2026, 9, 20));
+        assert_eq!(db.item(10).unwrap().unwrap().url, None, "a card without url stays NULL");
     }
 }

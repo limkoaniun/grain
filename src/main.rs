@@ -5,6 +5,7 @@
 
 mod app;
 mod db;
+mod import;
 mod sync;
 mod ui;
 mod vault;
@@ -13,7 +14,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 
 use crate::app::App;
@@ -92,14 +93,38 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// A terminal event reduced to the two things `run_loop` acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Action {
+    Key(KeyCode, KeyModifiers),
+    Paste(String),
+}
+
+/// Reduce a raw crossterm `Event` to an `Action`, or `None` if `run_loop` should ignore it:
+/// key releases/repeats, mouse, focus and resize events all fall through to `None`.
+fn event_to_action(ev: Event) -> Option<Action> {
+    match ev {
+        Event::Paste(s) => Some(Action::Paste(s)),
+        Event::Key(k) if k.kind == KeyEventKind::Press => Some(Action::Key(k.code, k.modifiers)),
+        _ => None,
+    }
+}
+
 fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+    crossterm::execute!(std::io::stdout(), EnableBracketedPaste).context("bracketed paste")?;
+    let result = run_events(terminal, app);
+    crossterm::execute!(std::io::stdout(), DisableBracketedPaste).context("bracketed paste")?;
+    result
+}
+
+fn run_events(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui::render(frame, app))?;
         if event::poll(TICK)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key_with(key.code, key.modifiers)?;
-                }
+            match event_to_action(event::read()?) {
+                Some(Action::Key(code, mods)) => app.handle_key_with(code, mods)?,
+                Some(Action::Paste(s)) => app.paste(&s),
+                None => {}
             }
         }
         app.tick(Instant::now(), chrono::Local::now().date_naive())?;
@@ -161,5 +186,38 @@ mod tests {
         assert!(parse(&["--help"]).unwrap().is_none());
         assert!(parse(&["--vault"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
+    }
+
+    #[test]
+    fn paste_event_maps_to_paste_action() {
+        assert_eq!(
+            event_to_action(Event::Paste("abc".into())),
+            Some(Action::Paste("abc".to_string()))
+        );
+    }
+
+    #[test]
+    fn key_release_maps_to_none() {
+        let key = crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert_eq!(event_to_action(Event::Key(key)), None);
+    }
+
+    #[test]
+    fn key_press_maps_to_key_action() {
+        let key = crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(
+            event_to_action(Event::Key(key)),
+            Some(Action::Key(KeyCode::Char('a'), KeyModifiers::NONE))
+        );
+    }
+
+    #[test]
+    fn resize_and_focus_map_to_none() {
+        assert_eq!(event_to_action(Event::Resize(80, 24)), None);
+        assert_eq!(event_to_action(Event::FocusGained), None);
     }
 }

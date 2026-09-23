@@ -45,6 +45,17 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         super::note_box(frame, area, &[Line::from("article is empty · tab back to queue")], None);
         return;
     }
+    if area.height == 0 {
+        return;
+    }
+    // An imported article says where it came from on the first row; the body starts
+    // one row lower. A path import has no `url` and no line.
+    let mut area = area;
+    if let Some(url) = read.item.url.as_deref() {
+        let row = Rect { height: 1, ..area };
+        frame.render_widget(super::url_line(url, read.item.imported, area.width), row);
+        area = Rect { y: area.y + 1, height: area.height - 1, ..area };
+    }
     if area.width <= GUTTER || area.height == 0 {
         return;
     }
