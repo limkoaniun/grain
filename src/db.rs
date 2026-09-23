@@ -277,10 +277,10 @@ impl Db {
         self.select_items("WHERE done IS NULL ORDER BY prio ASC, due ASC, sm_id ASC", &[])
     }
 
-    /// Cards with `due IS NULL OR due <= today`, in queue order.
-    pub fn due_cards(&self, today: NaiveDate) -> Result<Vec<ItemRow>> {
+    /// Items of both types with `due IS NULL OR due <= today`, `done` excluded, in queue order.
+    pub fn due_items(&self, today: NaiveDate) -> Result<Vec<ItemRow>> {
         self.select_items(
-            "WHERE type = 'card' AND done IS NULL AND (due IS NULL OR due <= ?1)
+            "WHERE done IS NULL AND (due IS NULL OR due <= ?1)
              ORDER BY prio ASC, due ASC, sm_id ASC",
             &[&today.to_string()],
         )
@@ -604,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn due_cards_excludes_articles_and_future_cards() {
+    fn due_items_mixes_types_in_queue_order_and_skips_future() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_item(&card(1, "a.md", 10, Some("2026-09-25"))).unwrap();
         db.upsert_item(&card(2, "b.md", 20, Some("2026-09-20"))).unwrap();
@@ -612,8 +612,8 @@ mod tests {
         let mut art = card(4, "art.md", 5, None);
         art.kind = ItemType::Article;
         db.upsert_item(&art).unwrap();
-        let ids: Vec<i64> = db.due_cards(d("2026-09-20")).unwrap().iter().map(|i| i.sm_id).collect();
-        assert_eq!(ids, [2, 3]);
+        let ids: Vec<i64> = db.due_items(d("2026-09-20")).unwrap().iter().map(|i| i.sm_id).collect();
+        assert_eq!(ids, [4, 2, 3], "cards and articles both due, future card excluded, prio ASC then due ASC");
     }
 
     #[test]
@@ -776,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn done_items_are_hidden_from_the_queue_and_from_due_cards() {
+    fn done_items_are_hidden_from_the_queue_and_from_due_items() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_item(&article(1, "a.md", 20, None)).unwrap();
         db.upsert_item(&article(2, "b.md", 20, Some("2026-09-25"))).unwrap();
@@ -786,8 +786,8 @@ mod tests {
         db.upsert_item(&card(4, "k.md", 10, None)).unwrap();
         let ids: Vec<i64> = db.queue().unwrap().iter().map(|i| i.sm_id).collect();
         assert_eq!(ids, [4, 1, 2], "done hidden; prio then due");
-        let due: Vec<i64> = db.due_cards(d("2026-09-20")).unwrap().iter().map(|i| i.sm_id).collect();
-        assert_eq!(due, [4], "due_cards stays cards only and skips done");
+        let due_items: Vec<i64> = db.due_items(d("2026-09-20")).unwrap().iter().map(|i| i.sm_id).collect();
+        assert_eq!(due_items, [4, 1], "due_items mixes types and skips done");
     }
 
     #[test]

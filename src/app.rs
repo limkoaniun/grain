@@ -164,19 +164,34 @@ pub struct CurrentCard {
 #[derive(Debug, Clone, Copy)]
 struct Graded {
     journal_id: i64,
+    sm_id: i64,
     grade: u8,
     /// Position in `Review::due` to return to on undo.
     pos: usize,
 }
 
-/// Review session over the cards due today.
+/// Where the session stands: the main pass, the `y/n` prompt at its end, or the drill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Phase {
+    #[default]
+    Main,
+    DrillPrompt,
+    Drilling,
+}
+
+/// Learn session over the cards and articles due today.
 #[derive(Debug, Default)]
 pub struct Review {
-    /// Due card sm_ids in queue order, fixed at startup (plus any card opened early).
+    /// Due sm_ids of both types in queue order, fixed at startup (plus any item opened early).
     pub due: Vec<i64>,
     /// Index into `due`; equal to `due.len()` when the session is finished.
     pub pos: usize,
     pub done: usize,
+    /// Articles rescheduled or marked done this session.
+    pub read_done: usize,
+    /// Cards failed in the main pass, in memory only, front first. Never journaled.
+    pub drill: Vec<i64>,
+    pub phase: Phase,
     pub revealed: bool,
     pub current: Option<CurrentCard>,
     /// Status line under the grade row, e.g. `graded 4 · journaled (offline)`.
@@ -224,17 +239,18 @@ pub struct App {
 }
 
 impl App {
-    /// Open the vault, refresh the index and build the queue and review session. Offline.
+    /// Open the vault, refresh the index and build the queue and learn session, landing
+    /// on the first due item. Offline.
     pub fn open(root: &Path, today: NaiveDate) -> Result<Self> {
         let db = Db::open(&root.join(".grain").join("grain.db"))?;
         let refresh = refresh(root, &db).context("refreshing index")?;
         let items = db.queue()?;
-        let due = db.due_cards(today)?.into_iter().map(|i| i.sm_id).collect();
-        Ok(App {
+        let due = db.due_items(today)?.into_iter().map(|i| i.sm_id).collect();
+        let mut app = App {
             root: root.to_path_buf(),
             db,
             items,
-            screen: Screen::Queue,
+            screen: Screen::Review,
             queue_sel: 0,
             review: Review {
                 due,
@@ -250,7 +266,9 @@ impl App {
             last_grade: None,
             now: Instant::now(),
             today,
-        })
+        };
+        app.load_current()?;
+        Ok(app)
     }
 
     /// Like [`App::open`], then start syncing grades through `scheduler`: the outbox is
@@ -309,14 +327,33 @@ impl App {
         format!("queue · sort prio{}", self.unsynced_suffix())
     }
 
+    /// `card · prio 12 · 1/6`: where the session stands, `drill · prio 12 · 2 left`
+    /// during the final drill, or `card · 6/6` once the main pass is over.
     pub fn review_context(&self) -> String {
-        let due = self.review.due.len();
-        let done = self.review.done;
+        let len = self.review.due.len();
         let suffix = self.unsynced_suffix();
         match &self.review.current {
-            Some(cur) => format!("card · prio {} · due {due} · done {done}/{due}{suffix}", cur.item.prio),
-            None => format!("card · due {due} · done {done}/{due}{suffix}"),
+            Some(cur) if self.review.phase == Phase::Drilling => {
+                format!("drill · prio {} · {} left{suffix}", cur.item.prio, self.review.drill.len())
+            }
+            Some(cur) => format!("card · prio {} · {}/{len}{suffix}", cur.item.prio, self.review.pos + 1),
+            None => format!("card · {len}/{len}{suffix}"),
         }
+    }
+
+    /// `final drill · 2 cards · y/n`: the offer made when the main pass ends with failures.
+    pub fn drill_prompt(&self) -> String {
+        let n = self.review.drill.len();
+        format!("final drill · {n} card{} · y/n", if n == 1 { "" } else { "s" })
+    }
+
+    /// `nothing more to learn · 4 graded · 2 read`: the session is over. Drill grades
+    /// are not counted; undone grades are already off `done`.
+    pub fn finish_line(&self) -> String {
+        format!(
+            "nothing more to learn · {} graded · {} read",
+            self.review.done, self.review.read_done
+        )
     }
 
     /// `read · prio 20 · ¶ 3/12 · 2 harvested` for the status row on the read screen.
@@ -568,13 +605,10 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => self.queue_sel = self.queue_sel.saturating_sub(1),
             KeyCode::Enter => {
-                let Some(item) = self.items.get(self.queue_sel) else {
+                let Some(sm_id) = self.items.get(self.queue_sel).map(|i| i.sm_id) else {
                     return Ok(());
                 };
-                match item.kind {
-                    ItemType::Card => self.open_review_at(item.sm_id)?,
-                    ItemType::Article => self.open_read(item.sm_id)?,
-                }
+                self.jump_to(sm_id)?;
             }
             KeyCode::Char('p') => {
                 if let Some(item) = self.items.get(self.queue_sel).cloned() {
@@ -650,6 +684,19 @@ impl App {
                     self.open_prompt(&item);
                 }
             }
+            (KeyCode::Char('u'), false) => {
+                // Undo reaches back to the card graded before this article. On success
+                // `undo` loads that card and leaves the read screen; on refusal it only
+                // sets a status line, which this screen does not render, so it is shown
+                // as a notice and the article stays up.
+                self.save_read_pos()?;
+                self.undo()?;
+                if self.screen == Screen::Review {
+                    self.read = None;
+                } else {
+                    self.notice = self.review.status.clone();
+                }
+            }
             (KeyCode::Tab | KeyCode::BackTab, false) => {
                 self.save_read_pos()?;
                 self.read = None;
@@ -687,7 +734,7 @@ impl App {
         self.reload_items()
     }
 
-    /// `enter`/`space`: a review. Save the read-point, schedule the next reading, back to the queue.
+    /// `enter`/`space`: a review. Save the read-point, schedule the next reading, next item.
     fn end_read_session(&mut self) -> Result<()> {
         let Some(r) = self.read.take() else {
             return Ok(());
@@ -701,9 +748,8 @@ impl App {
         let mtime = write_article_session(&self.root, &r.item.path, pos, due, interval)?;
         self.db.set_article_session(r.item.sm_id, due, interval, pos, mtime)?;
         self.reload_items()?;
-        self.screen = Screen::Queue;
         self.notice = Some(format!("{} · next in {interval} days", r.item.path));
-        Ok(())
+        self.advance_read()
     }
 
     /// `d`: the article is finished. It leaves the queue; its children stay.
@@ -714,9 +760,17 @@ impl App {
         let mtime = write_done(&self.root, &r.item.path, self.today)?;
         self.db.set_done(r.item.sm_id, self.today, mtime)?;
         self.reload_items()?;
-        self.screen = Screen::Queue;
         self.notice = Some(format!("done · {}", r.item.path));
-        Ok(())
+        self.advance_read()
+    }
+
+    /// The article is dealt with: count it and move the session on to the next item.
+    /// The status line goes with it; a grade two items back is not this card's news.
+    fn advance_read(&mut self) -> Result<()> {
+        self.set_status(None);
+        self.review.read_done += 1;
+        self.review.pos += 1;
+        self.load_current()
     }
 
     /// Ctrl+x: the selection, or the current paragraph, becomes a child article.
@@ -828,7 +882,14 @@ impl App {
         Ok(())
     }
 
+    /// The phase decides what a key means: the prompt swallows grades, and a drill
+    /// grade never reaches the journaling `grade`.
     fn handle_review_key(&mut self, key: KeyCode) -> Result<()> {
+        match self.review.phase {
+            Phase::DrillPrompt => return self.handle_drill_prompt_key(key),
+            Phase::Drilling => return self.handle_drill_key(key),
+            Phase::Main => {}
+        }
         match key {
             KeyCode::Char(' ') => {
                 if self.review.current.is_some() {
@@ -847,19 +908,77 @@ impl App {
         Ok(())
     }
 
-    fn cycle_screen(&mut self) -> Result<()> {
-        self.screen = match self.screen {
-            Screen::Queue => {
-                self.load_current()?;
-                Screen::Review
+    /// `y` starts the final drill, `n` drops it. Every other key is ignored;
+    /// `tab` and `q` are handled before the screen sees the key.
+    fn handle_drill_prompt_key(&mut self, key: KeyCode) -> Result<()> {
+        match key {
+            KeyCode::Char('y') => {
+                // The main pass is over: its last grade's status (and sync countdown)
+                // must not sit under a drill card.
+                self.set_status(None);
+                self.review.phase = Phase::Drilling;
+                self.load_drill_card()?;
             }
-            Screen::Review | Screen::Read => Screen::Queue,
-        };
+            KeyCode::Char('n') => {
+                self.review.drill.clear();
+                self.review.phase = Phase::Main;
+                self.set_status(None);
+            }
+            _ => {}
+        }
         Ok(())
     }
 
-    /// Jump the review session to `sm_id`, inserting it if it is not due yet.
-    fn open_review_at(&mut self, sm_id: i64) -> Result<()> {
+    /// Reveal and grade in the drill. There is no undo: the grades were never written.
+    fn handle_drill_key(&mut self, key: KeyCode) -> Result<()> {
+        match key {
+            KeyCode::Char(' ') => {
+                if self.review.current.is_some() {
+                    self.review.revealed = true;
+                }
+            }
+            KeyCode::Char(c @ '0'..='5') => {
+                if self.review.revealed {
+                    self.drill_grade(c as u8 - b'0')?;
+                }
+            }
+            KeyCode::Char('u') => self.set_status(Some("no undo in drill".to_string())),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A drill grade: 4 or 5 clears the card, 0–3 sends it to the back of the list.
+    /// Held in memory only — no journal row, no outbox entry, no file write, no `last_grade`.
+    fn drill_grade(&mut self, grade: u8) -> Result<()> {
+        if self.review.drill.is_empty() {
+            return Ok(());
+        }
+        let sm_id = self.review.drill.remove(0);
+        if grade >= 4 {
+            self.set_status(Some(format!("drill {grade} · cleared")));
+        } else {
+            self.review.drill.push(sm_id);
+            self.set_status(Some(format!("drill {grade} · stays")));
+        }
+        self.load_drill_card()
+    }
+
+    /// `tab`: the table from the session, the session from the table. Coming back from the
+    /// table reopens whatever the session is on, which may be either screen.
+    fn cycle_screen(&mut self) -> Result<()> {
+        match self.screen {
+            Screen::Queue => self.load_current()?,
+            Screen::Review | Screen::Read => self.screen = Screen::Queue,
+        }
+        Ok(())
+    }
+
+    /// Jump the session to `sm_id`, inserting it at the current position if it is not due yet.
+    /// A jump always shows the chosen item, so it leaves the drill prompt and the drill
+    /// itself; the drill list survives and the prompt returns when the pass runs out again.
+    fn jump_to(&mut self, sm_id: i64) -> Result<()> {
+        self.review.phase = Phase::Main;
         match self.review.due.iter().position(|&id| id == sm_id) {
             Some(idx) => self.review.pos = idx,
             None => {
@@ -869,16 +988,51 @@ impl App {
             }
         }
         self.set_status(None);
-        self.load_current()?;
-        self.screen = Screen::Review;
-        Ok(())
+        self.load_current()
     }
 
-    /// Load the card at `review.pos` from disk, or clear when the session is finished.
+    /// Show the item at `review.pos`: a card in review, an article on the read screen.
+    /// Past the end of the main pass there is nothing to show, the screen stays review
+    /// and a non-empty drill list turns into the prompt. While drilling the list, not
+    /// `review.pos`, says what to show, so `tab` back from the table resumes the drill.
     fn load_current(&mut self) -> Result<()> {
+        if self.review.phase == Phase::Drilling {
+            return self.load_drill_card();
+        }
         self.review.revealed = false;
         let Some(&sm_id) = self.review.due.get(self.review.pos) else {
             self.review.current = None;
+            self.screen = Screen::Review;
+            if self.review.phase == Phase::Main && !self.review.drill.is_empty() {
+                self.review.phase = Phase::DrillPrompt;
+            }
+            return Ok(());
+        };
+        let item = self
+            .db
+            .item(sm_id)?
+            .with_context(|| format!("sm_id {sm_id} vanished from the index"))?;
+        match item.kind {
+            ItemType::Card => {
+                let card = load_card(&self.root, &item.path)?;
+                self.review.current = Some(CurrentCard { item, card });
+                self.screen = Screen::Review;
+            }
+            ItemType::Article => {
+                self.review.current = None;
+                self.open_read(sm_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Show the card at the front of the drill list; an empty list ends the session.
+    fn load_drill_card(&mut self) -> Result<()> {
+        self.review.revealed = false;
+        let Some(&sm_id) = self.review.drill.first() else {
+            self.review.phase = Phase::Main;
+            self.review.current = None;
+            self.screen = Screen::Review;
             return Ok(());
         };
         let item = self
@@ -887,6 +1041,7 @@ impl App {
             .with_context(|| format!("sm_id {sm_id} vanished from the index"))?;
         let card = load_card(&self.root, &item.path)?;
         self.review.current = Some(CurrentCard { item, card });
+        self.screen = Screen::Review;
         Ok(())
     }
 
@@ -908,9 +1063,14 @@ impl App {
             .insert_grade(sm_id, grade, &graded_at.to_rfc3339_opts(SecondsFormat::Secs, true))?;
         self.review.history.push(Graded {
             journal_id,
+            sm_id,
             grade,
             pos: self.review.pos,
         });
+        // Anything below Good joins the final drill, once, in the order first failed.
+        if grade <= 3 && !self.review.drill.contains(&sm_id) {
+            self.review.drill.push(sm_id);
+        }
         self.review.done += 1;
         if let Some(sync) = self.sync.as_mut() {
             sync.outbox.enqueue(
@@ -952,7 +1112,14 @@ impl App {
             return Ok(());
         }
         self.review.done = self.review.done.saturating_sub(1);
-        self.review.pos = last.pos;
+        // The card leaves the drill list with the grade that put it there, unless another
+        // failing grade of this session still stands for it (`history` has already popped).
+        if !self.review.history.iter().any(|g| g.sm_id == last.sm_id && g.grade <= 3) {
+            self.review.drill.retain(|&id| id != last.sm_id);
+        }
+        // By identity, since an item inserted from the table may have shifted the session
+        // since this grade; `pos` is the fallback for an item no longer in the list.
+        self.review.pos = self.review.due.iter().position(|&id| id == last.sm_id).unwrap_or(last.pos);
         self.load_current()?;
         self.review.revealed = true;
         self.set_status(Some(format!("undid grade {}", last.grade)));
@@ -998,9 +1165,9 @@ mod tests {
     }
 
     #[test]
-    fn opens_queue_with_all_eight_items_sorted_by_prio() {
+    fn the_queue_table_holds_all_eight_items_sorted_by_prio() {
         let (_d, app) = fixture_app();
-        assert_eq!(app.screen, Screen::Queue);
+        assert_eq!(app.screen, Screen::Review, "the session, not the table");
         assert_eq!(app.items.len(), 8);
         let prios: Vec<i64> = app.items.iter().map(|i| i.prio).collect();
         assert!(prios.windows(2).all(|w| w[0] <= w[1]));
@@ -1009,16 +1176,9 @@ mod tests {
     }
 
     #[test]
-    fn due_cards_are_those_due_today_or_earlier_or_undated() {
-        let (_d, app) = fixture_app();
-        // kumquat (09-10), yuzu (none), bergamot (09-01), finger-lime (none); pomelo 09-25 and
-        // buddhas-hand 09-30 are not due.
-        assert_eq!(app.review.due.len(), 4);
-    }
-
-    #[test]
     fn j_and_k_move_selection_within_bounds() {
         let (_d, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
         press(&mut app, 'k');
         assert_eq!(app.queue_sel, 0);
         for _ in 0..20 {
@@ -1032,6 +1192,7 @@ mod tests {
     #[test]
     fn enter_on_article_opens_the_read_screen_and_notices_clear_on_the_next_key() {
         let (_d, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
         let idx = app.items.iter().position(|i| i.kind == ItemType::Article).unwrap();
         app.queue_sel = idx;
         app.handle_key(KeyCode::Enter).unwrap();
@@ -1046,31 +1207,27 @@ mod tests {
     #[test]
     fn enter_on_card_opens_review_of_that_card() {
         let (_d, mut app) = fixture_app();
-        let idx = app.items.iter().position(|i| i.path == "kumquat.md").unwrap();
-        app.queue_sel = idx;
-        app.handle_key(KeyCode::Enter).unwrap();
+        open_from_table(&mut app, "kumquat.md");
         assert_eq!(app.screen, Screen::Review);
         let cur = app.review.current.as_ref().unwrap();
         assert_eq!(cur.item.path, "kumquat.md");
         assert!(!app.review.revealed);
-        assert_eq!(app.review_context(), "card · prio 35 · due 4 · done 0/4");
+        assert_eq!(app.review_context(), "card · prio 35 · 3/6");
     }
 
     #[test]
     fn enter_on_not_yet_due_card_reviews_it_anyway() {
         let (_d, mut app) = fixture_app();
-        let idx = app.items.iter().position(|i| i.path == "pomelo.md").unwrap();
-        app.queue_sel = idx;
-        app.handle_key(KeyCode::Enter).unwrap();
+        open_from_table(&mut app, "pomelo.md");
         assert_eq!(app.review.current.as_ref().unwrap().item.sm_id, 1042);
-        assert_eq!(app.review.due.len(), 5);
+        assert_eq!(app.review.due.len(), 7);
     }
 
     #[test]
     fn grade_requires_reveal_then_journals_and_advances() {
         let (_d, mut app) = fixture_app();
-        app.handle_key(KeyCode::Tab).unwrap();
-        assert_eq!(app.screen, Screen::Review);
+        // Start at kumquat: finger-lime follows it, so the next item is another card.
+        open_from_table(&mut app, "kumquat.md");
         let first = app.review.current.as_ref().unwrap().item.sm_id;
         press(&mut app, '4');
         assert_eq!(app.db.journal_count(first).unwrap(), 0, "grade before reveal is ignored");
@@ -1088,7 +1245,9 @@ mod tests {
     #[test]
     fn undo_removes_newest_grade_and_returns_to_that_card() {
         let (_d, mut app) = fixture_app();
-        app.handle_key(KeyCode::Tab).unwrap();
+        // Two not-yet-due cards inserted at the front, so three cards run back to back.
+        open_from_table(&mut app, "pomelo.md");
+        open_from_table(&mut app, "buddhas-hand.md");
         let first = app.review.current.as_ref().unwrap().item.sm_id;
         press(&mut app, ' ');
         press(&mut app, '3');
@@ -1110,29 +1269,35 @@ mod tests {
     }
 
     #[test]
-    fn finishing_all_due_cards_leaves_review_empty() {
+    fn grading_past_the_end_is_a_no_op_and_undo_brings_the_last_card_back() {
         let (_d, mut app) = fixture_app();
-        app.handle_key(KeyCode::Tab).unwrap();
-        for _ in 0..4 {
-            press(&mut app, ' ');
-            press(&mut app, '3');
+        // Grade 4 throughout: this is about the end of the main pass, and a failing
+        // grade would end it on the drill prompt instead, where `u` does not apply.
+        for _ in 0..6 {
+            if app.screen == Screen::Read {
+                app.handle_key(KeyCode::Enter).unwrap();
+            } else {
+                press(&mut app, ' ');
+                press(&mut app, '4');
+            }
         }
         assert!(app.review.current.is_none());
-        assert_eq!(app.review_context(), "card · due 4 · done 4/4");
+        assert_eq!(app.review.phase, Phase::Main);
         press(&mut app, ' ');
-        press(&mut app, '3');
+        press(&mut app, '4');
         assert_eq!(app.review.done, 4, "grading with no card is a no-op");
         press(&mut app, 'u');
-        assert!(app.review.current.is_some());
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "bergamot.md");
+        assert_eq!(app.review.done, 3);
     }
 
     #[test]
     fn tab_cycles_screens_and_q_quits_and_unknown_keys_are_ignored() {
         let (_d, mut app) = fixture_app();
         app.handle_key(KeyCode::Tab).unwrap();
-        assert_eq!(app.screen, Screen::Review);
-        app.handle_key(KeyCode::Tab).unwrap();
         assert_eq!(app.screen, Screen::Queue);
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.screen, Screen::Review);
         press(&mut app, 'x');
         app.handle_key(KeyCode::F(5)).unwrap();
         assert!(!app.should_quit);
@@ -1200,7 +1365,12 @@ mod tests {
         Local::now().date_naive()
     }
 
+    /// Grade the card the session is on, ending the reading of any article it stops at
+    /// on the way there: these tests are about cards and sync only.
     fn grade_current(app: &mut App, g: char) -> (i64, String) {
+        while app.screen == Screen::Read {
+            app.handle_key(KeyCode::Enter).unwrap();
+        }
         let cur = app.review.current.as_ref().unwrap();
         let (sm_id, path) = (cur.item.sm_id, cur.item.path.clone());
         press(app, ' ');
@@ -1211,7 +1381,6 @@ mod tests {
     #[test]
     fn offline_app_has_no_sync_and_tick_is_a_no_op() {
         let (_d, mut app) = fixture_app();
-        app.handle_key(KeyCode::Tab).unwrap();
         grade_current(&mut app, '4');
         tick(&mut app, Duration::from_secs(60));
         assert_eq!(status(&app), "graded 4 · journaled (offline)");
@@ -1222,7 +1391,6 @@ mod tests {
     #[test]
     fn grace_countdown_then_undo_cancels_the_send() {
         let (_d, mut app) = synced_app(FakeScheduler::always_ok(), &[]);
-        app.handle_key(KeyCode::Tab).unwrap();
         let (sm_id, _) = grade_current(&mut app, '4');
         assert_eq!(status(&app), "graded 4 · journaled · sync in 5s");
         assert!(app.review_context().ends_with("· 1 unsynced"), "{}", app.review_context());
@@ -1241,9 +1409,9 @@ mod tests {
     #[test]
     fn grade_syncs_writes_schedule_and_the_file_stays_unchanged_afterwards() {
         let (dir, mut app) = synced_app(FakeScheduler::always_ok(), &[("sync_grace_secs", "0")]);
-        app.handle_key(KeyCode::Tab).unwrap();
         let (sm_id, path) = grade_current(&mut app, '4');
-        let shown = app.review.current.as_ref().unwrap().item.sm_id;
+        // The session moved on to the article that follows yuzu; the sync must not move it.
+        let shown = app.read.as_ref().unwrap().item.sm_id;
         let journal_id = app.db.pending_grades().unwrap()[0].journal_id;
         tick_until(&mut app, Duration::ZERO, |a| status(a).starts_with("graded 4 · synced"));
         let due = review_date() + chrono::Days::new(12);
@@ -1259,7 +1427,7 @@ mod tests {
             "keys in place, list key intact: {text}"
         );
         assert!(text.ends_with("A: yuzu 柚子 (ゆず)\n"), "body intact: {text}");
-        assert_eq!(app.review.current.as_ref().unwrap().item.sm_id, shown, "screen did not jump");
+        assert_eq!(app.read.as_ref().unwrap().item.sm_id, shown, "screen did not jump");
         assert_eq!(app.queue_context(), "queue · sort prio");
         assert_eq!(app.db.pending_grades().unwrap().len(), 0);
         assert_eq!(app.db.meta("sync_requests_today").unwrap().as_deref(), Some("1"));
@@ -1277,7 +1445,6 @@ mod tests {
     fn undo_is_refused_once_the_grade_is_in_flight_or_synced() {
         let (fake, release) = FakeScheduler::gated();
         let (_d, mut app) = synced_app(fake, &[("sync_grace_secs", "0")]);
-        app.handle_key(KeyCode::Tab).unwrap();
         let (sm_id, _) = grade_current(&mut app, '4');
         tick(&mut app, Duration::ZERO);
         assert_eq!(status(&app), "graded 4 · syncing…");
@@ -1300,7 +1467,6 @@ mod tests {
             Ok(Reviewed { interval: 3 }),
         ]);
         let (_d, mut app) = synced_app(fake, &[("sync_grace_secs", "0")]);
-        app.handle_key(KeyCode::Tab).unwrap();
         grade_current(&mut app, '4');
         tick_until(&mut app, Duration::ZERO, |a| status(a).contains("sync failed"));
         assert_eq!(status(&app), "graded 4 · sync failed (connection refused) · retry in 2s");
@@ -1313,7 +1479,6 @@ mod tests {
     fn auth_failure_stops_syncing_and_keeps_rows_pending() {
         let fake = FakeScheduler::new(vec![Err(ApiError::Unauthorized { status: 401, message: "bad key".to_string() })]);
         let (_d, mut app) = synced_app(fake, &[("sync_grace_secs", "0")]);
-        app.handle_key(KeyCode::Tab).unwrap();
         grade_current(&mut app, '4');
         tick_until(&mut app, Duration::ZERO, |a| status(a).starts_with("sync stopped"));
         assert_eq!(status(&app), format!("sync stopped · 401 unauthorized · check {API_KEY_ENV}"));
@@ -1329,7 +1494,6 @@ mod tests {
     fn rejected_grade_is_kept_unsynced_and_the_next_one_still_goes() {
         let fake = FakeScheduler::new(vec![Err(ApiError::Rejected { message: "grade: must be ≤ 5".to_string() })]);
         let (_d, mut app) = synced_app(fake, &[("sync_grace_secs", "0")]);
-        app.handle_key(KeyCode::Tab).unwrap();
         grade_current(&mut app, '4');
         tick_until(&mut app, Duration::ZERO, |a| status(a).contains("rejected"));
         assert_eq!(status(&app), "graded 4 · rejected by API (grade: must be ≤ 5) · kept unsynced");
@@ -1343,7 +1507,6 @@ mod tests {
     #[test]
     fn daily_cap_holds_the_second_grade_until_tomorrow() {
         let (_d, mut app) = synced_app(FakeScheduler::always_ok(), &[("sync_grace_secs", "0"), ("sync_daily_cap", "1")]);
-        app.handle_key(KeyCode::Tab).unwrap();
         grade_current(&mut app, '4');
         tick_until(&mut app, Duration::ZERO, |a| status(a).starts_with("graded 4 · synced"));
         grade_current(&mut app, '3');
@@ -1370,7 +1533,6 @@ mod tests {
         let first;
         {
             let mut app = App::open(dir.path(), today()).unwrap();
-            app.handle_key(KeyCode::Tab).unwrap();
             first = grade_current(&mut app, '3').0;
             grade_current(&mut app, '5');
         }
@@ -1400,7 +1562,6 @@ mod tests {
     fn finish_waits_for_the_row_in_flight_and_leaves_capped_rows_pending() {
         let (fake, release) = FakeScheduler::gated();
         let (_d, mut app) = synced_app(fake, &[("sync_grace_secs", "0"), ("sync_daily_cap", "1")]);
-        app.handle_key(KeyCode::Tab).unwrap();
         let (first, _) = grade_current(&mut app, '4');
         let (second, _) = grade_current(&mut app, '3');
         tick(&mut app, Duration::ZERO);
@@ -1418,7 +1579,6 @@ mod tests {
     #[test]
     fn finish_sends_rows_still_waiting_for_grace() {
         let (_d, mut app) = synced_app(FakeScheduler::always_ok(), &[]);
-        app.handle_key(KeyCode::Tab).unwrap();
         grade_current(&mut app, '4');
         assert_eq!(status(&app), "graded 4 · journaled · sync in 5s");
         assert_eq!(app.finish().unwrap(), 0);
@@ -1429,7 +1589,6 @@ mod tests {
     fn a_card_deleted_before_its_sync_lands_is_still_marked_synced() {
         let (fake, release) = FakeScheduler::gated();
         let (dir, mut app) = synced_app(fake, &[("sync_grace_secs", "0")]);
-        app.handle_key(KeyCode::Tab).unwrap();
         let (_, path) = grade_current(&mut app, '4');
         tick(&mut app, Duration::ZERO);
         std::fs::remove_file(dir.path().join(&path)).unwrap();
@@ -1447,7 +1606,6 @@ mod tests {
     #[test]
     fn a_dead_worker_drops_to_offline_and_keeps_the_row_pending() {
         let (_d, mut app) = synced_app(FakeScheduler::panicking(), &[("sync_grace_secs", "0")]);
-        app.handle_key(KeyCode::Tab).unwrap();
         let (sm_id, _) = grade_current(&mut app, '4');
         tick(&mut app, Duration::ZERO);
         // The worker panics on this request; wait for the app to notice the thread is gone.
@@ -1472,10 +1630,18 @@ mod tests {
         app.handle_key_with(KeyCode::Char(c), KeyModifiers::CONTROL).unwrap();
     }
 
-    fn open_article(app: &mut App, path: &str) {
+    /// Show the table, whatever screen we are on, and open `path` from it.
+    fn open_from_table(app: &mut App, path: &str) {
+        if app.screen != Screen::Queue {
+            app.handle_key(KeyCode::Tab).unwrap();
+        }
         let idx = app.items.iter().position(|i| i.path == path).unwrap();
         app.queue_sel = idx;
         app.handle_key(KeyCode::Enter).unwrap();
+    }
+
+    fn open_article(app: &mut App, path: &str) {
+        open_from_table(app, path);
         assert_eq!(app.screen, Screen::Read, "{path}");
     }
 
@@ -1624,7 +1790,8 @@ mod tests {
         open_article(&mut app, "citrus-vocab.md");
         press(&mut app, 'j'); // paragraph 4 at 207
         app.handle_key(KeyCode::Enter).unwrap();
-        assert_eq!(app.screen, Screen::Queue);
+        assert_eq!(app.screen, Screen::Review, "on to the next item, not the table");
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "kumquat.md");
         assert_eq!(app.notice.as_deref(), Some("citrus-vocab.md · next in 7 days"));
         let due = today() + chrono::Days::new(7);
         let text = file(&dir, "citrus-vocab.md");
@@ -1667,7 +1834,7 @@ mod tests {
 
         open_article(&mut app, "citrus-vocab.md");
         press(&mut app, 'd');
-        assert_eq!(app.screen, Screen::Queue);
+        assert_eq!(app.screen, Screen::Review, "on to the next item, not the table");
         assert_eq!(app.notice.as_deref(), Some("done · citrus-vocab.md"));
         assert!(file(&dir, "citrus-vocab.md").contains(&format!("\ndone: {}\n", today())));
         assert!(!app.items.iter().any(|i| i.sm_id == 1001), "left the queue");
@@ -1683,6 +1850,7 @@ mod tests {
     #[test]
     fn priority_prompt_takes_digits_or_nudges_on_queue_and_read_screens() {
         let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
         let idx = app.items.iter().position(|i| i.path == "kumquat.md").unwrap();
         app.queue_sel = idx;
         press(&mut app, 'p');
@@ -1759,6 +1927,425 @@ mod tests {
         assert_eq!(app.refresh.allocated, 0);
         assert_eq!(app.items, expected);
         assert_eq!(app.db.children_of("citrus-vocab").unwrap().len(), 3);
+    }
+
+    // ---- M3 learn session ----
+
+    #[test]
+    fn open_lands_on_the_first_due_item() {
+        let (_d, app) = fixture_app();
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "yuzu.md");
+        assert_eq!(app.review_context(), "card · prio 12 · 1/6");
+    }
+
+    #[test]
+    fn due_items_are_cards_and_articles_due_today_or_earlier_or_undated() {
+        let (_d, app) = fixture_app();
+        // yuzu (none), citrus-vocab (none), kumquat (09-10), finger-lime (none),
+        // earl-grey (none), bergamot (09-01); pomelo 09-25 and buddhas-hand 09-30 are not due.
+        assert_eq!(app.review.due.len(), 6);
+    }
+
+    #[test]
+    fn grading_a_card_moves_to_the_next_item_even_an_article() {
+        let (_d, mut app) = fixture_app();
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        assert_eq!(app.screen, Screen::Read);
+        assert_eq!(read(&app).item.path, "citrus-vocab.md");
+        assert_eq!(app.review.pos, 1);
+        assert!(app.review.current.is_none(), "the article is not a card in review");
+    }
+
+    #[test]
+    fn article_enter_advances_to_the_next_item_not_the_table() {
+        let (dir, mut app) = fixture_app();
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "kumquat.md");
+        assert_eq!(app.review.read_done, 1);
+        let text = file(&dir, "citrus-vocab.md");
+        assert!(text.contains("\ndue: 2026-09-27\ninterval: 7\n"), "M2 scheduling unchanged: {text}");
+    }
+
+    #[test]
+    fn article_d_advances_too() {
+        let (_d, mut app) = fixture_app();
+        press(&mut app, ' ');
+        press(&mut app, '4'); // yuzu
+        app.handle_key(KeyCode::Enter).unwrap(); // citrus-vocab
+        press(&mut app, ' ');
+        press(&mut app, '4'); // kumquat
+        press(&mut app, ' ');
+        press(&mut app, '4'); // finger-lime
+        assert_eq!(read(&app).item.path, "earl-grey.md");
+        press(&mut app, 'd');
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "bergamot.md");
+        // citrus-vocab was read, earl-grey was marked done: both count as read.
+        assert_eq!(app.review.read_done, 2);
+    }
+
+    #[test]
+    fn tab_from_read_saves_and_tab_back_reopens_the_same_article() {
+        let (dir, mut app) = fixture_app();
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        assert_eq!(read(&app).cursor, 2, "opens at read_pos 83");
+        press(&mut app, 'j');
+        press(&mut app, 'j');
+        assert_eq!(read(&app).cursor, 3, "clamped at the last of four paragraphs");
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.screen, Screen::Queue);
+        assert!(app.read.is_none());
+        assert!(file(&dir, "citrus-vocab.md").contains("\nread_pos: 207\n"));
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.screen, Screen::Read);
+        assert_eq!(read(&app).item.path, "citrus-vocab.md");
+        assert_eq!(read(&app).cursor, 3, "back at the saved read-point");
+        assert_eq!(app.review.pos, 1, "still the same place in the session");
+    }
+
+    #[test]
+    fn u_on_the_read_screen_undoes_the_grade_before_it() {
+        let (_d, mut app) = fixture_app();
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        assert_eq!(read(&app).item.path, "citrus-vocab.md");
+        let yuzu = 1044;
+        assert_eq!(app.db.journal_count(yuzu).unwrap(), 1);
+        press(&mut app, 'u');
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "yuzu.md");
+        assert!(app.review.revealed);
+        assert_eq!(app.review.status.as_deref(), Some("undid grade 4"));
+        assert!(app.read.is_none());
+        assert_eq!(app.db.journal_count(yuzu).unwrap(), 0);
+    }
+
+    #[test]
+    fn u_on_the_read_screen_with_nothing_to_undo_says_so_and_stays() {
+        let (_d, mut app) = fixture_app();
+        open_article(&mut app, "citrus-vocab.md");
+        press(&mut app, 'u');
+        assert_eq!(app.screen, Screen::Read);
+        assert!(app.read.is_some());
+        // The read screen shows no status line, so the refusal arrives as a notice.
+        assert_eq!(app.notice.as_deref(), Some("nothing to undo"));
+    }
+
+    #[test]
+    fn the_grade_status_line_does_not_survive_an_article() {
+        let (_d, mut app) = fixture_app();
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        assert_eq!(app.review.status.as_deref(), Some("graded 4 · journaled (offline)"));
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "kumquat.md");
+        assert!(app.review.status.is_none(), "{:?} belongs to the card two items back", app.review.status);
+    }
+
+    #[test]
+    fn enter_on_a_table_row_inserts_an_undue_item_at_the_current_position() {
+        let (_d, mut app) = fixture_app();
+        open_from_table(&mut app, "pomelo.md");
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.review.due.len(), 7);
+        assert_eq!(app.review.pos, 0);
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "pomelo.md");
+        assert_eq!(app.review_context(), "card · prio 28 · 1/7");
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "yuzu.md");
+    }
+
+    #[test]
+    fn enter_on_a_table_article_jumps_the_session_there() {
+        let (_d, mut app) = fixture_app();
+        open_from_table(&mut app, "earl-grey.md");
+        assert_eq!(app.screen, Screen::Read);
+        assert_eq!(app.review.pos, 4);
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "bergamot.md");
+    }
+
+    #[test]
+    fn finishing_the_session_shows_no_current_item() {
+        let (_d, mut app) = fixture_app();
+        for _ in 0..6 {
+            if app.screen == Screen::Read {
+                app.handle_key(KeyCode::Enter).unwrap();
+            } else {
+                press(&mut app, ' ');
+                press(&mut app, '4');
+            }
+        }
+        assert!(app.review.current.is_none());
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.review_context(), "card · 6/6");
+        assert_eq!(app.review.done, 4);
+        assert_eq!(app.review.read_done, 2);
+    }
+
+    // ---- M3 final drill ----
+
+    fn id_of(app: &App, path: &str) -> i64 {
+        app.items.iter().find(|i| i.path == path).unwrap().sm_id
+    }
+
+    /// Walk the whole main pass: yuzu 2, kumquat 3, finger-lime and bergamot 4,
+    /// both articles `enter`. Leaves the session on the drill prompt.
+    fn walk_to_prompt(app: &mut App) {
+        walk_to_prompt_with(app, ['2', '3', '4', '4']);
+    }
+
+    /// The same walk with one grade per card, in session order: yuzu, kumquat,
+    /// finger-lime, bergamot. The two articles are ended with `enter`.
+    fn walk_to_prompt_with(app: &mut App, grades: [char; 4]) {
+        let mut grades = grades.into_iter();
+        for _ in 0..6 {
+            if app.screen == Screen::Read {
+                app.handle_key(KeyCode::Enter).unwrap();
+            } else {
+                press(app, ' ');
+                press(app, grades.next().unwrap());
+            }
+        }
+    }
+
+    /// Modification times of every markdown file in the vault, by name.
+    fn mtimes(dir: &tempfile::TempDir) -> Vec<(String, std::time::SystemTime)> {
+        let mut out: Vec<(String, std::time::SystemTime)> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.metadata().unwrap().modified().unwrap(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A vault holding only the named fixture files.
+    fn vault_with(names: &[&str]) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/vault");
+        for name in names {
+            std::fs::copy(src.join(name), dir.path().join(name)).unwrap();
+        }
+        let app = App::open(dir.path(), today()).unwrap();
+        (dir, app)
+    }
+
+    #[test]
+    fn failing_grades_join_the_drill_list_once() {
+        let (_d, mut app) = fixture_app();
+        let yuzu = id_of(&app, "yuzu.md");
+        press(&mut app, ' ');
+        press(&mut app, '2');
+        assert_eq!(app.review.drill, vec![yuzu]);
+        open_from_table(&mut app, "yuzu.md");
+        press(&mut app, ' ');
+        press(&mut app, '1');
+        assert_eq!(app.review.drill, vec![yuzu], "a second failure adds nothing");
+    }
+
+    #[test]
+    fn passing_grades_do_not_join_the_drill_list() {
+        let (_d, mut app) = fixture_app();
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        assert!(app.review.drill.is_empty());
+    }
+
+    #[test]
+    fn undo_removes_the_card_from_the_drill_list() {
+        let (_d, mut app) = fixture_app();
+        press(&mut app, ' ');
+        press(&mut app, '2');
+        assert_eq!(app.review.drill.len(), 1);
+        press(&mut app, 'u');
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "yuzu.md");
+        assert!(app.review.drill.is_empty());
+    }
+
+    #[test]
+    fn undo_keeps_a_card_whose_earlier_failing_grade_still_stands() {
+        let (_d, mut app) = fixture_app();
+        let yuzu = id_of(&app, "yuzu.md");
+        press(&mut app, ' ');
+        press(&mut app, '2');
+        assert_eq!(app.review.drill, vec![yuzu]);
+        open_from_table(&mut app, "yuzu.md");
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        assert_eq!(app.review.drill, vec![yuzu], "a pass does not clear the drill list");
+        press(&mut app, 'u');
+        assert_eq!(app.review.drill, vec![yuzu], "undoing the pass leaves the failure standing");
+    }
+
+    #[test]
+    fn end_of_session_with_failures_shows_the_drill_prompt() {
+        let (_d, mut app) = fixture_app();
+        walk_to_prompt(&mut app);
+        assert_eq!(app.review.phase, Phase::DrillPrompt);
+        assert_eq!(app.drill_prompt(), "final drill · 2 cards · y/n");
+        assert_eq!(app.review_context(), "card · 6/6");
+    }
+
+    #[test]
+    fn n_finishes_and_empties_the_drill() {
+        let (_d, mut app) = fixture_app();
+        walk_to_prompt(&mut app);
+        press(&mut app, 'n');
+        assert_eq!(app.review.phase, Phase::Main);
+        assert!(app.review.drill.is_empty());
+        assert_eq!(app.finish_line(), "nothing more to learn · 4 graded · 2 read");
+    }
+
+    #[test]
+    fn y_clears_the_last_real_grade_status_before_the_first_drill_card() {
+        let (_d, mut app) = fixture_app();
+        walk_to_prompt(&mut app);
+        assert_eq!(app.review.status.as_deref(), Some("graded 4 · journaled (offline)"), "bergamot's grade");
+        press(&mut app, 'y');
+        assert_eq!(app.review.phase, Phase::Drilling);
+        assert!(app.review.status.is_none(), "the main-pass grade must not sit under a drill card");
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        assert_eq!(app.review.status.as_deref(), Some("drill 4 · cleared"));
+    }
+
+    #[test]
+    fn y_drills_until_every_card_passes() {
+        let (_d, mut app) = fixture_app();
+        let (yuzu, kumquat) = (id_of(&app, "yuzu.md"), id_of(&app, "kumquat.md"));
+        walk_to_prompt(&mut app);
+        press(&mut app, 'y');
+        assert_eq!(app.review.phase, Phase::Drilling);
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "yuzu.md");
+        assert_eq!(app.review_context(), "drill · prio 12 · 2 left");
+
+        press(&mut app, ' ');
+        press(&mut app, '3');
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "kumquat.md");
+        assert_eq!(app.review.drill, vec![kumquat, yuzu], "a failed card goes to the back");
+        assert_eq!(app.review.status.as_deref(), Some("drill 3 · stays"));
+
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "yuzu.md");
+        assert_eq!(app.review.drill, vec![yuzu]);
+        assert_eq!(app.review_context(), "drill · prio 12 · 1 left");
+        assert_eq!(app.review.status.as_deref(), Some("drill 4 · cleared"));
+
+        press(&mut app, ' ');
+        press(&mut app, '5');
+        assert_eq!(app.review.phase, Phase::Main);
+        assert!(app.review.current.is_none());
+        assert!(app.review.drill.is_empty());
+        assert_eq!(app.finish_line(), "nothing more to learn · 4 graded · 2 read");
+    }
+
+    #[test]
+    fn opening_a_card_from_the_table_at_the_prompt_shows_the_card() {
+        let (_d, mut app) = fixture_app();
+        let yuzu = id_of(&app, "yuzu.md");
+        walk_to_prompt_with(&mut app, ['2', '4', '4', '4']);
+        open_from_table(&mut app, "pomelo.md");
+        assert_eq!(app.review.phase, Phase::Main, "the table jump leaves the prompt");
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "pomelo.md");
+        assert_eq!(app.review_context(), "card · prio 28 · 7/7");
+        assert_eq!(app.review.drill, vec![yuzu], "the drill list is kept");
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        assert_eq!(app.review.phase, Phase::DrillPrompt, "the prompt comes back at the end");
+        assert_eq!(app.drill_prompt(), "final drill · 1 card · y/n");
+    }
+
+    #[test]
+    fn opening_an_item_from_the_table_while_drilling_leaves_the_drill() {
+        let (_d, mut app) = fixture_app();
+        let yuzu = id_of(&app, "yuzu.md");
+        walk_to_prompt_with(&mut app, ['2', '4', '4', '4']);
+        press(&mut app, 'y');
+        assert_eq!(app.review.phase, Phase::Drilling);
+        open_from_table(&mut app, "pomelo.md");
+        assert_eq!(app.review.phase, Phase::Main);
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "pomelo.md");
+        assert_eq!(app.review.drill, vec![yuzu], "the drill list is kept");
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        assert_eq!(app.review.phase, Phase::DrillPrompt);
+        assert_eq!(app.drill_prompt(), "final drill · 1 card · y/n");
+    }
+
+    #[test]
+    fn drill_grades_write_nothing() {
+        let (dir, mut app) = fixture_app();
+        walk_to_prompt(&mut app);
+        let cards = ["yuzu.md", "kumquat.md", "finger-lime.md", "bergamot.md"];
+        let journalled: Vec<i64> =
+            cards.iter().map(|p| app.db.journal_count(id_of(&app, p)).unwrap()).collect();
+        let pending = app.db.pending_grades().unwrap().len();
+        let files = mtimes(&dir);
+        let done = app.review.done;
+
+        press(&mut app, 'y');
+        for g in ['3', '4', '5'] {
+            press(&mut app, ' ');
+            press(&mut app, g);
+        }
+        assert!(app.review.drill.is_empty(), "the drill ran to the end");
+
+        let after: Vec<i64> = cards.iter().map(|p| app.db.journal_count(id_of(&app, p)).unwrap()).collect();
+        assert_eq!(after, journalled, "no journal row");
+        assert_eq!(app.db.pending_grades().unwrap().len(), pending, "no outbox work");
+        assert_eq!(mtimes(&dir), files, "no file write");
+        assert_eq!(app.review.done, done, "drill grades are not counted");
+    }
+
+    #[test]
+    fn u_in_drill_says_so_and_changes_nothing() {
+        let (_d, mut app) = fixture_app();
+        walk_to_prompt(&mut app);
+        press(&mut app, 'y');
+        let drill = app.review.drill.clone();
+        let current = app.review.current.as_ref().unwrap().item.sm_id;
+        press(&mut app, 'u');
+        assert_eq!(app.review.status.as_deref(), Some("no undo in drill"));
+        assert_eq!(app.review.drill, drill);
+        assert_eq!(app.review.current.as_ref().unwrap().item.sm_id, current);
+    }
+
+    #[test]
+    fn tab_during_drill_and_back_resumes_it() {
+        let (_d, mut app) = fixture_app();
+        walk_to_prompt(&mut app);
+        press(&mut app, 'y');
+        let current = app.review.current.as_ref().unwrap().item.sm_id;
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.screen, Screen::Queue);
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.review.phase, Phase::Drilling);
+        assert_eq!(app.review.current.as_ref().unwrap().item.sm_id, current);
+    }
+
+    #[test]
+    fn empty_session_opens_on_the_finish_line() {
+        let (_d, app) = vault_with(&["pomelo.md", "buddhas-hand.md"]);
+        assert_eq!(app.screen, Screen::Review);
+        assert!(app.review.current.is_none());
+        assert_eq!(app.review.phase, Phase::Main);
+        assert_eq!(app.finish_line(), "nothing more to learn · 0 graded · 0 read");
     }
 
     #[test]

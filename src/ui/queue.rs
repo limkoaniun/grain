@@ -12,7 +12,7 @@ pub const HINTS: &[(&str, &str)] = &[
     ("j/k", "move"),
     ("enter", "open"),
     ("p", "prio"),
-    ("tab", "review"),
+    ("tab", "learn"),
     ("q", "quit"),
 ];
 

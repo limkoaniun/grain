@@ -19,7 +19,9 @@ pub const HINTS: &[(&str, &str)] = &[
     ("^z", "cloze"),
     ("enter", "next"),
     ("d", "done"),
-    ("p", "prio"),
+    // `p` opens the priority prompt here too, but the row is full at 80 columns
+    // and the queue already shows `p prio`.
+    ("u", "undo"),
 ];
 
 pub const SELECT_HINTS: &[(&str, &str)] = &[
