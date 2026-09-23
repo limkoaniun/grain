@@ -341,10 +341,11 @@ impl App {
         }
     }
 
-    /// `final drill · 2 cards · y/n`: the offer made when the main pass ends with failures.
+    /// `final drill · 2 cards`: the offer made when the main pass ends with failures.
+    /// The `y`/`n` keys are drawn inside the note box, not in this string.
     pub fn drill_prompt(&self) -> String {
         let n = self.review.drill.len();
-        format!("final drill · {n} card{} · y/n", if n == 1 { "" } else { "s" })
+        format!("final drill · {n} card{}", if n == 1 { "" } else { "s" })
     }
 
     /// `nothing more to learn · 4 graded · 2 read`: the session is over. Drill grades
@@ -368,6 +369,20 @@ impl App {
             ),
             None => "read".to_string(),
         }
+    }
+
+    /// `(reached, len)` for the status-row progress bar during the main pass; `None` elsewhere.
+    pub fn progress(&self) -> Option<(usize, usize)> {
+        let len = self.review.due.len();
+        if len == 0 || self.review.phase != Phase::Main || self.screen == Screen::Queue {
+            return None;
+        }
+        Some(((self.review.pos + 1).min(len), len))
+    }
+
+    /// The local date this session works against, fixed at open and moved on by `tick`.
+    pub fn today(&self) -> NaiveDate {
+        self.today
     }
 
     /// `selecting 4 words` or `selecting ¶ 3–5` while a selection is active on the read screen.
@@ -2196,7 +2211,7 @@ mod tests {
         let (_d, mut app) = fixture_app();
         walk_to_prompt(&mut app);
         assert_eq!(app.review.phase, Phase::DrillPrompt);
-        assert_eq!(app.drill_prompt(), "final drill · 2 cards · y/n");
+        assert_eq!(app.drill_prompt(), "final drill · 2 cards");
         assert_eq!(app.review_context(), "card · 6/6");
     }
 
@@ -2267,7 +2282,7 @@ mod tests {
         press(&mut app, ' ');
         press(&mut app, '4');
         assert_eq!(app.review.phase, Phase::DrillPrompt, "the prompt comes back at the end");
-        assert_eq!(app.drill_prompt(), "final drill · 1 card · y/n");
+        assert_eq!(app.drill_prompt(), "final drill · 1 card");
     }
 
     #[test]
@@ -2284,7 +2299,7 @@ mod tests {
         press(&mut app, ' ');
         press(&mut app, '4');
         assert_eq!(app.review.phase, Phase::DrillPrompt);
-        assert_eq!(app.drill_prompt(), "final drill · 1 card · y/n");
+        assert_eq!(app.drill_prompt(), "final drill · 1 card");
     }
 
     #[test]
@@ -2346,6 +2361,44 @@ mod tests {
         assert!(app.review.current.is_none());
         assert_eq!(app.review.phase, Phase::Main);
         assert_eq!(app.finish_line(), "nothing more to learn · 0 graded · 0 read");
+    }
+
+    #[test]
+    fn progress_counts_reached_items_in_the_main_pass_only() {
+        let (_d, mut app) = fixture_app();
+        assert_eq!(app.progress(), Some((1, 6)), "the first item is already reached");
+        press(&mut app, ' ');
+        press(&mut app, '4'); // yuzu graded; citrus-vocab (an article) is next
+        assert_eq!(app.progress(), Some((2, 6)), "the bar follows onto the read screen");
+        app.handle_key(KeyCode::Enter).unwrap(); // end the article
+        assert_eq!(app.progress(), Some((3, 6)));
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.screen, Screen::Queue);
+        assert_eq!(app.progress(), None, "no bar on the queue");
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.progress(), Some((3, 6)), "back on the session, back to the bar");
+
+        let (_d, mut app) = fixture_app();
+        walk_to_prompt(&mut app);
+        assert_eq!(app.review.phase, Phase::DrillPrompt);
+        assert_eq!(app.progress(), None, "no bar at the drill prompt");
+        press(&mut app, 'y');
+        assert_eq!(app.review.phase, Phase::Drilling);
+        assert_eq!(app.progress(), None, "no bar while drilling");
+
+        let (_d, app) = vault_with(&["pomelo.md", "buddhas-hand.md"]);
+        assert_eq!(app.progress(), None, "no bar when nothing is due");
+
+        let (_d, mut app) = fixture_app();
+        walk_to_prompt_with(&mut app, ['4', '4', '4', '4']);
+        assert_eq!(app.review.phase, Phase::Main, "no failure, no drill");
+        assert_eq!(app.progress(), Some((6, 6)), "a finished pass reads full");
+    }
+
+    #[test]
+    fn today_is_the_open_date() {
+        let (_d, app) = fixture_app();
+        assert_eq!(app.today(), NaiveDate::from_ymd_opt(2026, 9, 20).unwrap());
     }
 
     #[test]
