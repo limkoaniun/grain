@@ -48,6 +48,10 @@ pub struct ItemMeta {
     pub a_factor: Option<f64>,
     /// Article finished on this date (M2). `None` means active.
     pub done: Option<NaiveDate>,
+    /// Source URL (M5), SuperMemo `#Link`. `None` means none.
+    pub url: Option<String>,
+    /// Date the item was imported (M5), SuperMemo `#Date`. `None` means none.
+    pub imported: Option<NaiveDate>,
 }
 
 /// A markdown file split into its YAML frontmatter and body.
@@ -109,6 +113,8 @@ impl Document {
             tags: self.tags()?,
             a_factor: self.float("a_factor")?,
             done: self.date("done")?,
+            url: self.string("url")?,
+            imported: self.date("imported")?,
         })
     }
 
@@ -124,8 +130,8 @@ impl Document {
         self.set_after("interval", Value::from(interval), &["due", "sm_id", "type"]);
     }
 
-    // The M2 setters keep new keys in the documented order:
-    // due, interval, prio, read_pos, a_factor, done, source, range.
+    // The M2/M5 setters keep new keys in the documented order:
+    // due, interval, prio, read_pos, a_factor, done, source, range, url, imported.
 
     pub fn set_prio(&mut self, prio: i64) {
         self.set_after("prio", Value::from(prio), &["interval", "due", "sm_id", "type"]);
@@ -164,6 +170,27 @@ impl Document {
             "range",
             Value::from(range),
             &["source", "done", "a_factor", "read_pos", "prio", "interval", "due", "sm_id", "type"],
+        );
+    }
+
+    /// Set `url`, placing it after `range` (falling back through the earlier keys).
+    pub fn set_url(&mut self, url: &str) {
+        self.set_after(
+            "url",
+            Value::from(url),
+            &["range", "source", "done", "a_factor", "read_pos", "prio", "interval", "due", "sm_id", "type"],
+        );
+    }
+
+    /// Set `imported`, placing it after `url` (falling back through the earlier keys).
+    pub fn set_imported(&mut self, day: NaiveDate) {
+        self.set_after(
+            "imported",
+            Value::from(day.to_string()),
+            &[
+                "url", "range", "source", "done", "a_factor", "read_pos", "prio", "interval", "due", "sm_id",
+                "type",
+            ],
         );
     }
 
@@ -442,6 +469,50 @@ mod tests {
         assert!(Document::parse("no front\n").is_err());
         assert!(Document::parse("---\ntype: recipe\n---\nx\n").is_err());
         assert!(Document::parse("---\nprio: 1\n---\nx\n").is_err());
+    }
+
+    #[test]
+    fn meta_reads_url_and_imported() {
+        let doc = Document::parse(
+            "---\ntype: article\nsm_id: 7\nurl: https://x.org/a\nimported: 2026-09-20\n---\n# T\n",
+        )
+        .unwrap();
+        let meta = doc.meta().unwrap();
+        assert_eq!(meta.url.as_deref(), Some("https://x.org/a"));
+        assert_eq!(meta.imported, NaiveDate::from_ymd_opt(2026, 9, 20));
+    }
+
+    #[test]
+    fn set_url_and_imported_insert_after_range() {
+        let mut doc = Document::parse(
+            "---\ntype: article\nsm_id: 1\nprio: 20\nsource: '[[p]]'\nrange: 1-2\ntags:\n- t\n---\nbody\n",
+        )
+        .unwrap();
+        doc.set_url("https://x.org/a");
+        doc.set_imported(NaiveDate::from_ymd_opt(2026, 9, 20).unwrap());
+        let out = doc.serialize().unwrap();
+        assert!(
+            out.contains("\nrange: 1-2\nurl: https://x.org/a\nimported: 2026-09-20\ntags:\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn set_url_without_range_goes_after_sm_id() {
+        let mut doc = Document::parse("---\ntype: card\nsm_id: 1\n---\nQ: a\n\nA: b\n").unwrap();
+        doc.set_url("https://x.org/a");
+        doc.set_imported(NaiveDate::from_ymd_opt(2026, 9, 20).unwrap());
+        let out = doc.serialize().unwrap();
+        assert!(
+            out.contains("\nsm_id: 1\nurl: https://x.org/a\nimported: 2026-09-20\n---"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn imported_must_be_a_date() {
+        let err = Document::parse("---\ntype: article\nimported: soon\n---\nbody\n").unwrap_err();
+        assert!(err.to_string().contains("imported"), "{err}");
     }
 
     #[test]

@@ -20,9 +20,10 @@ use crate::sync::{
 };
 use crate::vault::frontmatter::ItemType;
 use crate::vault::index::{
-    create_child, load_card, refresh, write_article_session, write_done, write_prio, write_read_pos,
-    write_schedule, LoadedCard, RefreshReport,
+    create_child, create_item, load_card, refresh, write_article_session, write_done, write_prio,
+    write_read_pos, write_schedule, LoadedCard, NewItem, RefreshReport,
 };
+use crate::import::{fetch_title_body, html_to_markdown, Fetcher, UreqFetcher};
 
 /// How long `finish` waits for a reply already in flight.
 const QUIT_INFLIGHT_WAIT: Duration = Duration::from_secs(2);
@@ -153,6 +154,33 @@ struct Prompt {
     fresh: bool,
 }
 
+/// What the inline text prompt is collecting (M5).
+#[derive(Debug, Clone)]
+enum TextKind {
+    /// `a`, first step: the question of a new card.
+    CardQuestion,
+    /// `a`, second step: its answer, holding the question already typed.
+    CardAnswer { question: String },
+    /// `i`: the url or path of an article to import.
+    Import,
+}
+
+/// The inline free-text prompt in the status row (M5): `a` and `i`.
+#[derive(Debug, Clone)]
+struct TextPrompt {
+    kind: TextKind,
+    buf: String,
+}
+
+/// Which step of a text prompt is open, for the hints row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextStage {
+    /// `enter` moves on to another prompt.
+    Question,
+    /// `enter` commits.
+    Final,
+}
+
 /// The card on screen in review.
 #[derive(Debug, Clone)]
 pub struct CurrentCard {
@@ -230,12 +258,29 @@ pub struct App {
     /// The article open on the read screen (M2).
     pub read: Option<Read>,
     prompt: Option<Prompt>,
+    text_prompt: Option<TextPrompt>,
     sync: Option<Sync>,
     last_grade: Option<LastGrade>,
     /// The clock as of the last `tick`; `grade` uses it for the grace deadline.
     now: Instant,
     /// The local date as of open or the last `tick`.
     today: NaiveDate,
+    /// How `i` fetches a URL. Replaced in tests.
+    fetcher: Box<dyn Fetcher>,
+    /// A URL `i` accepted and has not fetched yet.
+    pending_import: Option<PendingImport>,
+}
+
+/// A URL waiting for the frame that says `fetching …`.
+///
+/// The event loop runs `draw`, then the key, then `tick`, so the `tick` that follows
+/// `enter` happens before the next `draw`: fetching there would block on the frame that
+/// still shows the open prompt and `fetching …` would never reach the screen. Arming on
+/// that first `tick` and fetching on the second puts a `draw` in between.
+struct PendingImport {
+    url: String,
+    /// False until the first `tick` after `enter`.
+    armed: bool,
 }
 
 impl App {
@@ -262,10 +307,13 @@ impl App {
             sync_log: Vec::new(),
             read: None,
             prompt: None,
+            text_prompt: None,
             sync: None,
             last_grade: None,
             now: Instant::now(),
             today,
+            fetcher: Box::new(UreqFetcher::new()),
+            pending_import: None,
         };
         app.load_current()?;
         Ok(app)
@@ -404,9 +452,40 @@ impl App {
         })
     }
 
-    /// `prio 28 › 30` while the priority prompt is open.
+    /// The open prompt as one line: `prio 28 › 30` for the priority prompt, else the
+    /// text prompt's label followed by what has been typed. The caret is the renderer's.
     pub fn prompt_text(&self) -> Option<String> {
-        self.prompt.as_ref().map(|p| format!("prio {} › {}", p.current, p.value))
+        if let Some(p) = self.prompt.as_ref() {
+            return Some(format!("prio {} › {}", p.current, p.value));
+        }
+        let t = self.text_prompt.as_ref()?;
+        let label = match t.kind {
+            TextKind::CardQuestion => "add card · Q: ",
+            TextKind::CardAnswer { .. } => "add card · A: ",
+            TextKind::Import => "import · url or path: ",
+        };
+        Some(format!("{label}{}", t.buf))
+    }
+
+    /// Which step of the text prompt is open, for the hints row. `None` when none is.
+    pub fn text_prompt_stage(&self) -> Option<TextStage> {
+        Some(match self.text_prompt.as_ref()?.kind {
+            TextKind::CardQuestion => TextStage::Question,
+            TextKind::CardAnswer { .. } | TextKind::Import => TextStage::Final,
+        })
+    }
+
+    /// Swap the fetcher `i` pulls a URL through (tests).
+    #[cfg(test)]
+    pub fn set_fetcher(&mut self, f: Box<dyn Fetcher>) {
+        self.fetcher = f;
+    }
+
+    /// A bracketed paste: appended to the open text prompt as one line. Ignored otherwise.
+    pub fn paste(&mut self, text: &str) {
+        if let Some(t) = self.text_prompt.as_mut() {
+            t.buf.extend(text.chars().filter(|c| *c != '\n' && *c != '\r'));
+        }
     }
 
     /// ` · 2 unsynced` while grades are waiting, in flight or rejected; empty otherwise.
@@ -430,6 +509,9 @@ impl App {
         if self.prompt.is_some() {
             return self.handle_prompt_key(key);
         }
+        if self.text_prompt.is_some() {
+            return self.handle_text_key(key, mods);
+        }
         if self.screen == Screen::Read {
             return self.handle_read_key(key, mods);
         }
@@ -450,6 +532,14 @@ impl App {
     pub fn tick(&mut self, now: Instant, today: NaiveDate) -> Result<()> {
         self.now = now;
         self.today = today;
+        match self.pending_import.take() {
+            None => {}
+            // First tick after `enter`: only arm it, so the `fetching …` frame is drawn.
+            Some(p) if !p.armed => {
+                self.pending_import = Some(PendingImport { url: p.url, armed: true });
+            }
+            Some(p) => self.run_import(&p.url)?,
+        }
         let Some(sync) = self.sync.as_mut() else {
             return Ok(());
         };
@@ -630,8 +720,172 @@ impl App {
                     self.open_prompt(&item);
                 }
             }
+            KeyCode::Char('a') => self.open_text_prompt(TextKind::CardQuestion),
+            KeyCode::Char('i') => self.open_text_prompt(TextKind::Import),
             _ => {}
         }
+        Ok(())
+    }
+
+    // ---- text prompt (M5) ----
+
+    fn open_text_prompt(&mut self, kind: TextKind) {
+        self.text_prompt = Some(TextPrompt {
+            kind,
+            buf: String::new(),
+        });
+    }
+
+    /// Every key while a text prompt is open: printable characters type, `backspace`
+    /// deletes, `esc` abandons, `enter` submits. Ctrl chords are ignored.
+    fn handle_text_key(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
+        let Some(t) = self.text_prompt.as_mut() else {
+            return Ok(());
+        };
+        match key {
+            KeyCode::Char(_) if mods.contains(KeyModifiers::CONTROL) => {}
+            KeyCode::Char(c) => t.buf.push(c),
+            KeyCode::Backspace => {
+                t.buf.pop();
+            }
+            KeyCode::Esc => self.text_prompt = None,
+            KeyCode::Enter => return self.submit_text(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// `enter`: an empty buffer is ignored, the question step moves on to the answer,
+    /// and the last step writes. The prompt closes only once the write has returned.
+    fn submit_text(&mut self) -> Result<()> {
+        let Some(t) = self.text_prompt.as_ref() else {
+            return Ok(());
+        };
+        let text = t.buf.trim().to_string();
+        if text.is_empty() {
+            return Ok(());
+        }
+        match t.kind.clone() {
+            TextKind::CardQuestion => {
+                self.text_prompt = Some(TextPrompt {
+                    kind: TextKind::CardAnswer { question: text },
+                    buf: String::new(),
+                });
+            }
+            TextKind::CardAnswer { question } => {
+                self.add_card(&question, &text)?;
+                self.text_prompt = None;
+            }
+            TextKind::Import => {
+                self.text_prompt = None;
+                self.start_import(&text)?;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- `i` import (M5) ----
+
+    /// `i` submitted. An `http(s)` URL is checked against the index and then queued for
+    /// the second `tick` from here, so a frame showing `fetching …` is drawn before the
+    /// fetch blocks the thread. Anything else is a path and is read right here.
+    fn start_import(&mut self, input: &str) -> Result<()> {
+        if !is_url(input) {
+            return self.import_path(input);
+        }
+        if let Some(row) = self.db.item_by_url(input)? {
+            self.queue_sel = self.items.iter().position(|i| i.sm_id == row.sm_id).unwrap_or(0);
+            self.notice = Some(format!("already imported · {}", row.path));
+            return Ok(());
+        }
+        self.pending_import = Some(PendingImport { url: input.to_string(), armed: false });
+        self.notice = Some("fetching …".to_string());
+        Ok(())
+    }
+
+    /// The deferred half of a URL import: fetch, strip and write. A fetch failure is a
+    /// notice and nothing is written; only a failure to write the file propagates.
+    fn run_import(&mut self, url: &str) -> Result<()> {
+        let fetched = fetch_title_body(self.fetcher.as_ref(), url);
+        let (title, body) = match fetched {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.notice = Some(format!("import failed · {}", e.root_cause()));
+                return Ok(());
+            }
+        };
+        let title = non_empty(title).unwrap_or_else(|| url_host(url).to_string());
+        self.write_import(&title, &body, Some(url))
+    }
+
+    /// `i` with a path: read the file, strip it when it is HTML and take it verbatim
+    /// otherwise. A read failure is a notice; nothing is written.
+    fn import_path(&mut self, input: &str) -> Result<()> {
+        let path = Path::new(input);
+        let read = std::fs::read_to_string(path).with_context(|| format!("reading {input}"));
+        let text = match read {
+            Ok(t) => t,
+            Err(e) => {
+                self.notice = Some(format!("import failed · {}", e.root_cause()));
+                return Ok(());
+            }
+        };
+        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let is_html = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
+        let (title, body) = if is_html {
+            let (title, body) = html_to_markdown(&text);
+            (non_empty(title).unwrap_or(stem), body)
+        } else {
+            (first_heading(&text).unwrap_or(stem), text)
+        };
+        self.write_import(&title, &body, None)
+    }
+
+    /// Write one imported article, re-read the queue and select it. The body keeps its
+    /// own leading `# ` heading; without one the title becomes the heading.
+    fn write_import(&mut self, title: &str, body: &str, url: Option<&str>) -> Result<()> {
+        let body = if body.starts_with("# ") {
+            body.to_string()
+        } else {
+            format!("# {title}\n\n{body}")
+        };
+        let row = create_item(
+            &self.root,
+            &self.db,
+            NewItem {
+                kind: ItemType::Article,
+                slug_base: title,
+                body: &body,
+                url,
+                imported: Some(self.today),
+            },
+        )?;
+        self.reload_items()?;
+        self.queue_sel = self.items.iter().position(|i| i.sm_id == row.sm_id).unwrap_or(0);
+        self.notice = Some(format!("imported {}", row.path));
+        Ok(())
+    }
+
+    /// Write a new card file, re-read the queue and select it. The learn session is
+    /// left alone: a card added today joins the queue, not the pass already running.
+    fn add_card(&mut self, question: &str, answer: &str) -> Result<()> {
+        let body = format!("Q: {question}\n\nA: {answer}\n");
+        let row = create_item(
+            &self.root,
+            &self.db,
+            NewItem {
+                kind: ItemType::Card,
+                slug_base: question,
+                body: &body,
+                url: None,
+                imported: None,
+            },
+        )?;
+        self.reload_items()?;
+        self.queue_sel = self.items.iter().position(|i| i.sm_id == row.sm_id).unwrap_or(0);
+        self.notice = Some(format!("added {}", row.path));
         Ok(())
     }
 
@@ -1147,6 +1401,30 @@ fn local_date(graded_at: &str) -> Result<NaiveDate> {
     let utc = DateTime::parse_from_rfc3339(graded_at)
         .with_context(|| format!("graded_at `{graded_at}` is not RFC 3339"))?;
     Ok(utc.with_timezone(&Local).date_naive())
+}
+
+/// Whether `i` should fetch `input` rather than read it off disk.
+fn is_url(input: &str) -> bool {
+    input.starts_with("http://") || input.starts_with("https://")
+}
+
+/// The host of `url`: between `://` and the next `/`, or the whole remainder.
+/// The title of last resort for a page with no usable `<title>`.
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    rest.split('/').next().unwrap_or(rest)
+}
+
+/// `Some` only when the title has visible text, trimmed.
+fn non_empty(title: Option<String>) -> Option<String> {
+    title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+/// The text of a leading `# ` heading, when `text` starts with one.
+fn first_heading(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("# ")?;
+    let line = rest.split('\n').next().unwrap_or(rest);
+    non_empty(Some(line.to_string()))
 }
 
 #[cfg(test)]
@@ -1937,6 +2215,369 @@ mod tests {
         assert_eq!(App::open(dir.path(), today()).unwrap().refresh.indexed, 0);
     }
 
+    // ---- text prompt: `a` add card (M5) ----
+
+    /// How many `.md` files sit directly in the vault root.
+    fn root_md_count(dir: &tempfile::TempDir) -> usize {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".md"))
+            .count()
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, c);
+        }
+    }
+
+    #[test]
+    fn a_opens_question_prompt_then_answer_then_writes_card() {
+        let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        press(&mut app, 'a');
+        assert_eq!(app.prompt_text().as_deref(), Some("add card · Q: "));
+        type_text(&mut app, "Big citrus?");
+        assert_eq!(app.prompt_text().as_deref(), Some("add card · Q: Big citrus?"));
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.prompt_text().as_deref(), Some("add card · A: "));
+        type_text(&mut app, "pomelo");
+        assert_eq!(app.prompt_text().as_deref(), Some("add card · A: pomelo"));
+        app.handle_key(KeyCode::Enter).unwrap();
+
+        assert_eq!(app.prompt_text(), None);
+        assert_eq!(app.notice.as_deref(), Some("added big-citrus.md"));
+        assert_eq!(app.screen, Screen::Queue);
+        let row = app.items.iter().find(|i| i.path == "big-citrus.md").unwrap().clone();
+        assert_eq!(row.kind, ItemType::Card);
+        assert_eq!(
+            file(&dir, "big-citrus.md"),
+            format!("---\ntype: card\nsm_id: {}\n---\nQ: Big citrus?\n\nA: pomelo\n", row.sm_id)
+        );
+        assert_eq!(app.items[app.queue_sel].path, "big-citrus.md", "the table selects the new card");
+    }
+
+    #[test]
+    fn a_esc_writes_nothing() {
+        let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        let before = root_md_count(&dir);
+
+        press(&mut app, 'a');
+        type_text(&mut app, "Big citrus?");
+        app.handle_key(KeyCode::Esc).unwrap();
+        assert_eq!(app.prompt_text(), None);
+        assert_eq!(root_md_count(&dir), before, "esc at the question writes nothing");
+
+        press(&mut app, 'a');
+        type_text(&mut app, "Big citrus?");
+        app.handle_key(KeyCode::Enter).unwrap();
+        type_text(&mut app, "pomelo");
+        app.handle_key(KeyCode::Esc).unwrap();
+        assert_eq!(app.prompt_text(), None);
+        assert_eq!(root_md_count(&dir), before, "esc at the answer writes nothing");
+    }
+
+    #[test]
+    fn a_enter_on_empty_is_ignored() {
+        let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        let before = root_md_count(&dir);
+        press(&mut app, 'a');
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.prompt_text().as_deref(), Some("add card · Q: "));
+        press(&mut app, ' ');
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.prompt_text().as_deref(), Some("add card · Q:  "), "blank is empty too");
+        type_text(&mut app, "Q");
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.prompt_text().as_deref(), Some("add card · A: "));
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.prompt_text().as_deref(), Some("add card · A: "), "empty answer is ignored");
+        assert_eq!(root_md_count(&dir), before);
+    }
+
+    #[test]
+    fn a_backspace_edits() {
+        let (_d, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        press(&mut app, 'a');
+        press(&mut app, 'x');
+        press(&mut app, 'y');
+        app.handle_key(KeyCode::Backspace).unwrap();
+        assert_eq!(app.prompt_text().as_deref(), Some("add card · Q: x"));
+        app.handle_key(KeyCode::Backspace).unwrap();
+        app.handle_key(KeyCode::Backspace).unwrap();
+        assert_eq!(app.prompt_text().as_deref(), Some("add card · Q: "), "backspace on empty is a no-op");
+
+        // The prompt takes every key: `q` types, `tab` and ctrl chords do nothing.
+        press(&mut app, 'q');
+        assert!(!app.should_quit, "q types instead of quitting while the prompt is open");
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.screen, Screen::Queue, "tab does not switch screens while the prompt is open");
+        app.handle_key_with(KeyCode::Char('x'), KeyModifiers::CONTROL).unwrap();
+        app.handle_key_with(KeyCode::Char('Q'), KeyModifiers::SHIFT).unwrap();
+        assert_eq!(app.prompt_text().as_deref(), Some("add card · Q: qQ"), "shift types, ctrl does not");
+    }
+
+    #[test]
+    fn a_is_ignored_off_the_queue_screen() {
+        let (_d, mut app) = fixture_app();
+        open_from_table(&mut app, "kumquat.md");
+        let sm_id = app.review.current.as_ref().unwrap().item.sm_id;
+        press(&mut app, 'a');
+        assert_eq!(app.prompt_text(), None);
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        assert_eq!(app.db.journal_count(sm_id).unwrap(), 1, "grades still work");
+
+        open_article(&mut app, "citrus-vocab.md");
+        press(&mut app, 'a');
+        assert_eq!(app.prompt_text(), None, "the read screen has no add-card key");
+        assert_eq!(app.screen, Screen::Read);
+    }
+
+    #[test]
+    fn text_prompt_hints_kind() {
+        let (_d, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.text_prompt_stage(), None);
+        press(&mut app, 'a');
+        assert_eq!(app.text_prompt_stage(), Some(TextStage::Question));
+        type_text(&mut app, "Q");
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.text_prompt_stage(), Some(TextStage::Final));
+        app.handle_key(KeyCode::Esc).unwrap();
+        assert_eq!(app.text_prompt_stage(), None);
+        press(&mut app, 'i');
+        assert_eq!(app.text_prompt_stage(), Some(TextStage::Final));
+    }
+
+    #[test]
+    fn paste_appends_to_prompt() {
+        let (_d, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        press(&mut app, 'i');
+        app.paste("https://x.org/a\n");
+        assert_eq!(app.prompt_text().as_deref(), Some("import · url or path: https://x.org/a"));
+        app.handle_key(KeyCode::Esc).unwrap();
+        app.paste("ignored");
+        assert_eq!(app.prompt_text(), None, "paste with no prompt open is ignored");
+    }
+
+    // ---- text prompt: `i` import article (M5) ----
+
+    /// The same HTML as `import::tests::html_scopes_to_main_and_drops_chrome`, so the
+    /// expected body here and the stripper's own expectation stay one string.
+    const WIKI_HTML: &str = "<html><head><title>Pomelo - Wikipedia</title><style>x</style></head><body><nav>Menu</nav><main><h1>Pomelo</h1><p>The pomelo is a <b>citrus</b> fruit &amp; large.</p><script>bad()</script><ul><li>one</li><li>two</li></ul><h2>Uses</h2><p>Juice.</p></main><footer>foot</footer></body></html>";
+    const WIKI_URL: &str = "https://en.wikipedia.org/wiki/Pomelo";
+    const WIKI_BODY: &str =
+        "# Pomelo\n\nThe pomelo is a citrus fruit & large.\n\n- one\n\n- two\n\n## Uses\n\nJuice.\n";
+
+    /// A [`Fetcher`] over a fixed map: url -> body, or url -> the error to report.
+    struct FakeFetcher(std::collections::HashMap<String, std::result::Result<String, String>>);
+
+    impl FakeFetcher {
+        fn ok(url: &str, body: &str) -> Self {
+            let mut m = std::collections::HashMap::new();
+            m.insert(url.to_string(), Ok(body.to_string()));
+            FakeFetcher(m)
+        }
+
+        fn err(url: &str, reason: &str) -> Self {
+            let mut m = std::collections::HashMap::new();
+            m.insert(url.to_string(), Err(reason.to_string()));
+            FakeFetcher(m)
+        }
+    }
+
+    impl Fetcher for FakeFetcher {
+        fn get(&self, url: &str) -> Result<String> {
+            match self.0.get(url) {
+                Some(Ok(body)) => Ok(body.clone()),
+                Some(Err(reason)) => Err(anyhow::anyhow!("{reason}")),
+                None => Err(anyhow::anyhow!("no route to {url}")),
+            }
+        }
+    }
+
+    /// `i`, type `input`, `enter`.
+    fn import(app: &mut App, input: &str) {
+        press(app, 'i');
+        type_text(app, input);
+        app.handle_key(KeyCode::Enter).unwrap();
+    }
+
+    /// One event-loop tick.
+    fn tick_once(app: &mut App) {
+        app.tick(Instant::now(), today()).unwrap();
+    }
+
+    /// The two ticks a URL import takes: the first arms it and leaves `fetching …` on
+    /// screen for the draw in between, the second fetches and writes.
+    fn tick_twice(app: &mut App) {
+        tick_once(app);
+        tick_once(app);
+    }
+
+    #[test]
+    fn i_url_fetches_on_the_second_tick_so_fetching_is_drawn() {
+        let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        let before = root_md_count(&dir);
+        app.set_fetcher(Box::new(FakeFetcher::ok(WIKI_URL, WIKI_HTML)));
+        import(&mut app, WIKI_URL);
+        assert_eq!(app.prompt_text(), None, "the prompt closes on enter");
+
+        // The loop draws between two ticks, so this is the frame the user sees.
+        tick_once(&mut app);
+        assert_eq!(app.notice.as_deref(), Some("fetching …"), "the fetch waits one frame");
+        assert_eq!(root_md_count(&dir), before, "nothing is written yet");
+        assert!(app.db.item_by_url(WIKI_URL).unwrap().is_none(), "nothing indexed yet");
+
+        tick_once(&mut app);
+        assert_eq!(app.notice.as_deref(), Some("imported pomelo-wikipedia.md"));
+        assert_eq!(root_md_count(&dir), before + 1);
+        assert!(dir.path().join("pomelo-wikipedia.md").exists());
+    }
+
+    #[test]
+    fn i_url_imports_article_with_reference() {
+        let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        app.set_fetcher(Box::new(FakeFetcher::ok(WIKI_URL, WIKI_HTML)));
+        import(&mut app, WIKI_URL);
+        tick_twice(&mut app);
+
+        assert_eq!(app.notice.as_deref(), Some("imported pomelo-wikipedia.md"));
+        let row = app.items.iter().find(|i| i.path == "pomelo-wikipedia.md").unwrap().clone();
+        assert_eq!(row.kind, ItemType::Article);
+        assert_eq!(row.url.as_deref(), Some(WIKI_URL));
+        assert_eq!(row.imported, Some(today()));
+        assert_eq!(
+            file(&dir, "pomelo-wikipedia.md"),
+            format!(
+                "---\ntype: article\nsm_id: {}\nurl: {WIKI_URL}\nimported: 2026-09-20\n---\n{WIKI_BODY}",
+                row.sm_id
+            )
+        );
+        assert_eq!(app.items[app.queue_sel].path, "pomelo-wikipedia.md", "the table selects it");
+    }
+
+    #[test]
+    fn i_duplicate_url_is_refused() {
+        let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        app.set_fetcher(Box::new(FakeFetcher::ok(WIKI_URL, WIKI_HTML)));
+        import(&mut app, WIKI_URL);
+        tick_twice(&mut app);
+        let after_first = root_md_count(&dir);
+
+        app.queue_sel = 0;
+        import(&mut app, WIKI_URL);
+        assert_eq!(app.notice.as_deref(), Some("already imported · pomelo-wikipedia.md"));
+        tick_once(&mut app);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("already imported · pomelo-wikipedia.md"),
+            "the refusal is final; the first tick arms nothing"
+        );
+        tick_once(&mut app);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("already imported · pomelo-wikipedia.md"),
+            "and the second tick fetches nothing"
+        );
+        assert_eq!(root_md_count(&dir), after_first, "no second file");
+        assert_eq!(app.items[app.queue_sel].path, "pomelo-wikipedia.md", "the table selects the original");
+    }
+
+    #[test]
+    fn i_fetch_error_reports_and_writes_nothing() {
+        let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        let before = root_md_count(&dir);
+        app.set_fetcher(Box::new(FakeFetcher::err(WIKI_URL, "connection refused")));
+        import(&mut app, WIKI_URL);
+        tick_once(&mut app);
+        assert_eq!(app.notice.as_deref(), Some("fetching …"), "the failure waits for the fetch");
+        tick_once(&mut app);
+
+        assert_eq!(app.notice.as_deref(), Some("import failed · connection refused"));
+        assert_eq!(root_md_count(&dir), before);
+        assert!(app.db.item_by_url(WIKI_URL).unwrap().is_none(), "nothing indexed");
+    }
+
+    #[test]
+    fn i_path_imports_markdown_verbatim() {
+        let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let path = src.path().join("notes.md");
+        std::fs::write(&path, "# Tea\n\nLeaves.\n").unwrap();
+
+        import(&mut app, &path.to_string_lossy());
+        assert_eq!(app.notice.as_deref(), Some("imported tea.md"), "a path import needs no tick");
+        let row = app.items.iter().find(|i| i.path == "tea.md").unwrap().clone();
+        assert_eq!(row.url, None, "a path import has no url");
+        assert_eq!(row.imported, Some(today()));
+        assert_eq!(
+            file(&dir, "tea.md"),
+            format!("---\ntype: article\nsm_id: {}\nimported: 2026-09-20\n---\n# Tea\n\nLeaves.\n", row.sm_id)
+        );
+        assert_eq!(app.items[app.queue_sel].path, "tea.md");
+    }
+
+    #[test]
+    fn i_path_without_heading_uses_stem() {
+        let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let path = src.path().join("plain.txt");
+        std::fs::write(&path, "Just text.\n").unwrap();
+
+        import(&mut app, &path.to_string_lossy());
+        assert_eq!(app.notice.as_deref(), Some("imported plain.md"));
+        let row = app.items.iter().find(|i| i.path == "plain.md").unwrap().clone();
+        assert_eq!(
+            file(&dir, "plain.md"),
+            format!("---\ntype: article\nsm_id: {}\nimported: 2026-09-20\n---\n# plain\n\nJust text.\n", row.sm_id)
+        );
+    }
+
+    #[test]
+    fn i_path_html_is_stripped() {
+        let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let path = src.path().join("page.html");
+        std::fs::write(&path, "<title>Page</title><main><p>Hi</p></main>").unwrap();
+
+        import(&mut app, &path.to_string_lossy());
+        assert_eq!(app.notice.as_deref(), Some("imported page.md"));
+        let row = app.items.iter().find(|i| i.path == "page.md").unwrap().clone();
+        assert_eq!(
+            file(&dir, "page.md"),
+            format!("---\ntype: article\nsm_id: {}\nimported: 2026-09-20\n---\n# Page\n\nHi\n", row.sm_id)
+        );
+    }
+
+    #[test]
+    fn i_missing_path_reports() {
+        let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        let before = root_md_count(&dir);
+        let src = tempfile::tempdir().unwrap();
+        let path = src.path().join("gone.md");
+
+        import(&mut app, &path.to_string_lossy());
+        let notice = app.notice.clone().unwrap();
+        assert!(notice.starts_with("import failed · "), "got {notice:?}");
+        assert_eq!(root_md_count(&dir), before, "nothing written");
+    }
+
     #[test]
     fn a_version_1_database_migrates_and_matches_a_rebuild() {
         let (dir, app) = fixture_app();
@@ -1946,17 +2587,20 @@ mod tests {
         let conn = rusqlite::Connection::open(dir.path().join(".grain/grain.db")).unwrap();
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_source;
+             DROP INDEX IF EXISTS idx_url;
              ALTER TABLE items DROP COLUMN a_factor;
              ALTER TABLE items DROP COLUMN done;
              ALTER TABLE items DROP COLUMN source;
              ALTER TABLE items DROP COLUMN range_start;
              ALTER TABLE items DROP COLUMN range_end;
+             ALTER TABLE items DROP COLUMN url;
+             ALTER TABLE items DROP COLUMN imported;
              UPDATE meta SET value = '1' WHERE key = 'schema_version';",
         )
         .unwrap();
         drop(conn);
         let app = App::open(dir.path(), today()).unwrap();
-        assert_eq!(app.db.meta("schema_version").unwrap().as_deref(), Some("2"));
+        assert_eq!(app.db.meta("schema_version").unwrap().as_deref(), Some("3"));
         assert_eq!(app.refresh.indexed, 8, "one full re-index after the migration");
         assert_eq!(app.refresh.allocated, 0);
         assert_eq!(app.items, expected);

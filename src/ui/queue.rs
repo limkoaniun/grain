@@ -15,6 +15,8 @@ use crate::vault::frontmatter::ItemType;
 pub const HINTS: &[(&str, &str)] = &[
     ("j/k", "move"),
     ("enter", "open"),
+    ("a", "add"),
+    ("i", "import"),
     ("p", "prio"),
     ("tab", "learn"),
     ("q", "quit"),

@@ -7,17 +7,20 @@ mod queue;
 mod read;
 mod review;
 
+use chrono::NaiveDate;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Phase, Screen};
+use crate::app::{App, Phase, Screen, TextStage};
 
 /// Amber for key letters in the hints row (256-color index, works without truecolor).
 pub const AMBER: Color = Color::Indexed(214);
 pub const COLLECTION_NAME: &str = "all";
+/// The caret drawn at the end of an open text prompt (U+258F).
+const CARET: char = '▏';
 
 pub fn render(frame: &mut Frame, app: &App) {
     let [top, rule_a, content, rule_b, hints] = frame
@@ -32,34 +35,44 @@ pub fn render(frame: &mut Frame, app: &App) {
     rule(frame, rule_a);
     rule(frame, rule_b);
 
-    // The status row's middle: the priority prompt, else a notice, else the selection.
+    // The status row's middle: the open prompt, else a notice, else the selection.
+    // A text prompt is being typed into, so it carries the caret; the priority
+    // prompt has no insertion point and stays as it is.
+    let stage = app.text_prompt_stage();
     let middle = app
         .prompt_text()
+        .map(|t| if stage.is_some() { format!("{t}{CARET}") } else { t })
         .or_else(|| app.notice.clone())
         .or_else(|| app.selection_status());
     let prompt_open = app.prompt_text().is_some();
+    // A text prompt takes the hints row on every screen.
+    let text_hints = stage.map(|stage| match stage {
+        TextStage::Question => TEXT_PROMPT_NEXT_HINTS,
+        TextStage::Final => TEXT_PROMPT_SAVE_HINTS,
+    });
     match app.screen {
         Screen::Queue => {
             status_row(frame, top, middle.as_deref(), &app.queue_context(), app.progress());
             queue::render(frame, content, app);
-            hints_row(frame, hints, if prompt_open { PROMPT_HINTS } else { queue::HINTS });
+            let base = if prompt_open { PROMPT_HINTS } else { queue::HINTS };
+            hints_row(frame, hints, text_hints.unwrap_or(base));
         }
         Screen::Review => {
             status_row(frame, top, middle.as_deref(), &app.review_context(), app.progress());
             review::render(frame, content, app);
-            hints_row(frame, hints, review_hints(app));
+            hints_row(frame, hints, text_hints.unwrap_or_else(|| review_hints(app)));
         }
         Screen::Read => {
             status_row(frame, top, middle.as_deref(), &app.read_context(), app.progress());
             read::render(frame, content, app);
-            let hints_for = if prompt_open {
+            let base = if prompt_open {
                 PROMPT_HINTS
             } else if app.selection_status().is_some() {
                 read::SELECT_HINTS
             } else {
                 read::HINTS
             };
-            hints_row(frame, hints, hints_for);
+            hints_row(frame, hints, text_hints.unwrap_or(base));
         }
     }
 }
@@ -77,6 +90,35 @@ fn review_hints(app: &App) -> &'static [(&'static str, &'static str)] {
 
 /// Hints while the priority prompt is open, on any screen.
 pub const PROMPT_HINTS: &[(&str, &str)] = &[("0-9", "value"), ("j/k", "nudge"), ("enter", "set"), ("esc", "cancel")];
+
+/// Hints on a text prompt step that leads to another step (the card's question).
+pub const TEXT_PROMPT_NEXT_HINTS: &[(&str, &str)] = &[("enter", "next"), ("esc", "cancel")];
+
+/// Hints on the last step of a text prompt (the card's answer, an import).
+pub const TEXT_PROMPT_SAVE_HINTS: &[(&str, &str)] = &[("enter", "save"), ("esc", "cancel")];
+
+/// `↗ en.wikipedia.org/wiki/Pomelo · 2026-09-20` (blue, dim): where an item was
+/// imported from and when. The scheme is dropped; the line is cut to `width`
+/// characters with `…` as the last one when it does not fit.
+pub(super) fn url_line(url: &str, imported: Option<NaiveDate>, width: u16) -> Line<'static> {
+    let width = width as usize;
+    if width == 0 {
+        return Line::default();
+    }
+    let short = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let mut text = format!("↗ {short}");
+    if let Some(day) = imported {
+        text.push_str(&format!(" · {day}"));
+    }
+    if text.chars().count() > width {
+        text = text.chars().take(width - 1).collect();
+        text.push('…');
+    }
+    Line::from(text).style(Style::new().fg(Color::Blue).dim())
+}
 
 /// One dim horizontal rule filling `area`. A line of `─`, never a `Block`.
 fn rule(frame: &mut Frame, area: Rect) {
@@ -189,6 +231,22 @@ mod tests {
         let app = App::open(dir.path(), today).unwrap();
         (dir, app)
     }
+
+    /// A one-file vault written before `App::open`, so the frontmatter is indexed.
+    /// With a single due item the app opens straight on that item's screen.
+    fn app_with_file(name: &str, content: &str) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(name), content).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let app = App::open(dir.path(), today).unwrap();
+        (dir, app)
+    }
+
+    /// A card carrying `url` and `imported` (M5).
+    const URL_CARD: &str = "---\ntype: card\nsm_id: 91\nprio: 5\nurl: https://en.wikipedia.org/wiki/Pomelo\nimported: 2026-09-20\n---\nQ: Largest citrus?\n\nA: pomelo\n";
+
+    /// An article carrying `url` but no `imported`.
+    const URL_ARTICLE: &str = "---\ntype: article\nsm_id: 93\nprio: 5\nurl: https://en.wikipedia.org/wiki/Pomelo\n---\nPomelo is a citrus.\n";
 
     fn vault_with(names: &[&str]) -> (tempfile::TempDir, App) {
         let dir = tempfile::tempdir().unwrap();
@@ -356,7 +414,11 @@ mod tests {
         assert!(body.contains('▪'), "{body}");
         assert!(r[23].contains("enter open"), "{:?}", r[23]);
         assert!(r[23].contains("q quit"), "{:?}", r[23]);
-        assert_eq!(r[23], "j/k move · enter open · p prio · tab learn · q quit", "p is a queue key (M2)");
+        assert_eq!(
+            r[23],
+            "j/k move · enter open · a add · i import · p prio · tab learn · q quit",
+            "p is a queue key (M2), a and i are M5"
+        );
         assert!(!r.iter().any(|l| l.contains('│') || l.contains('┌')), "no borders");
     }
 
@@ -813,6 +875,99 @@ mod tests {
     }
 
     #[test]
+    fn queue_hints_show_add_and_import() {
+        let (_d, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        let r = rows(&app);
+        assert_eq!(
+            r[23],
+            "j/k move · enter open · a add · i import · p prio · tab learn · q quit"
+        );
+        let add = r[23].find("a add").unwrap();
+        let import = r[23].find("i import").unwrap();
+        let prio = r[23].find("p prio").unwrap();
+        assert!(add < import && import < prio, "add and import come before prio: {:?}", r[23]);
+    }
+
+    #[test]
+    fn text_prompt_renders_in_status_row_with_hints() {
+        let (_d, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+
+        app.handle_key(KeyCode::Char('a')).unwrap();
+        let r = rows(&app);
+        assert!(r[0].contains("add card · Q: ▏"), "{:?}", r[0]);
+        assert!(r[23].contains("enter next"), "{:?}", r[23]);
+        assert!(r[23].contains("esc cancel"), "{:?}", r[23]);
+
+        for c in "why".chars() {
+            app.handle_key(KeyCode::Char(c)).unwrap();
+        }
+        let r = rows(&app);
+        assert!(r[0].contains("add card · Q: why▏"), "the caret follows the text: {:?}", r[0]);
+
+        app.handle_key(KeyCode::Enter).unwrap();
+        let r = rows(&app);
+        assert!(r[0].contains("add card · A: ▏"), "{:?}", r[0]);
+        assert!(r[23].contains("enter save"), "{:?}", r[23]);
+        assert!(r[23].contains("esc cancel"), "{:?}", r[23]);
+
+        app.handle_key(KeyCode::Esc).unwrap();
+        app.handle_key(KeyCode::Char('i')).unwrap();
+        let r = rows(&app);
+        assert!(r[0].contains("import · url or path: ▏"), "{:?}", r[0]);
+        assert!(r[23].contains("enter save"), "{:?}", r[23]);
+
+        // The priority prompt is unchanged: no caret, its own hints.
+        app.handle_key(KeyCode::Esc).unwrap();
+        app.handle_key(KeyCode::Char('p')).unwrap();
+        let r = rows(&app);
+        assert!(r[0].contains("prio 12 › 12"), "{:?}", r[0]);
+        assert!(!r[0].contains('▏'), "no caret on the priority prompt: {:?}", r[0]);
+        assert_eq!(r[23], "0-9 value · j/k nudge · enter set · esc cancel");
+    }
+
+    #[test]
+    fn review_shows_reference_line_for_url() {
+        let (_d, app) = app_with_file("pom.md", URL_CARD);
+        let r = rows(&app);
+        assert!(
+            r.iter().any(|l| l.trim() == "↗ en.wikipedia.org/wiki/Pomelo · 2026-09-20"),
+            "{r:?}"
+        );
+
+        // With a `source` as well, the `↳` line comes first and the `↗` line follows it.
+        let with_source = "---\ntype: card\nsm_id: 92\nprio: 5\nsource: \"[[citrus-vocab]]\"\nrange: 1-2\nurl: https://en.wikipedia.org/wiki/Pomelo\nimported: 2026-09-20\n---\nQ: Largest citrus?\n\nA: pomelo\n";
+        let (_d2, app) = app_with_file("pom2.md", with_source);
+        let r = rows(&app);
+        let down = r.iter().position(|l| l.contains("↳ citrus-vocab.md › 1-2")).unwrap();
+        let up = r.iter().position(|l| l.contains("↗ en.wikipedia.org/wiki/Pomelo")).unwrap();
+        assert_eq!(up, down + 1, "the url line sits under the source line: {r:?}");
+    }
+
+    #[test]
+    fn read_shows_reference_line_first() {
+        let (_d, app) = app_with_file("art.md", URL_ARTICLE);
+        assert_eq!(app.read.as_ref().unwrap().item.path, "art.md");
+        let r = rows(&app);
+        assert_eq!(r[2].trim(), "↗ en.wikipedia.org/wiki/Pomelo", "{r:?}");
+        assert!(r[3].contains("Pomelo is a citrus."), "the body starts one row lower: {r:?}");
+    }
+
+    #[test]
+    fn reference_line_truncates_long_url() {
+        let long = format!("https://example.org/{}", "a".repeat(200));
+        let (_d, app) = app_with_file(
+            "art.md",
+            &format!("---\ntype: article\nsm_id: 94\nprio: 5\nurl: {long}\n---\nBody here.\n"),
+        );
+        let r = rows(&app);
+        assert!(r[2].starts_with("↗ example.org/aaa"), "{:?}", r[2]);
+        assert!(r[2].ends_with('…'), "the cut url ends with an ellipsis: {:?}", r[2]);
+        assert_eq!(r[2].chars().count(), 80, "cut to the width exactly: {:?}", r[2]);
+    }
+
+    #[test]
     fn renders_at_narrow_sizes_without_panicking() {
         let (_d, mut app) = fixture_app();
         app.handle_key(KeyCode::Tab).unwrap();
@@ -833,5 +988,15 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             terminal.draw(|f| render(f, &app)).unwrap();
         }
+
+        // M5: an open text prompt and the two screens that carry a url reference line.
+        let (_prompt_dir, mut prompt_app) = fixture_app();
+        prompt_app.handle_key(KeyCode::Tab).unwrap();
+        prompt_app.handle_key(KeyCode::Char('a')).unwrap();
+        draw_tiny(&prompt_app);
+        let (_card_dir, card_app) = app_with_file("pom.md", URL_CARD);
+        draw_tiny(&card_app);
+        let (_art_dir, art_app) = app_with_file("art.md", URL_ARTICLE);
+        draw_tiny(&art_app);
     }
 }

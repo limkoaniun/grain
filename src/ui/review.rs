@@ -73,10 +73,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(1),
     ]));
 
-    // The reference line is the question's last line, so it hugs the text instead of
-    // floating at the bottom of the question area.
+    // The reference lines are the question's last lines, so they hug the text instead
+    // of floating at the bottom of the question area. `↳` (the parent) comes first,
+    // then `↗` (where an import came from); either may stand alone.
     let mut question = lines(&cur.card.body.question);
     question.extend(reference_line(&cur.card.meta));
+    if let Some(url) = cur.card.meta.url.as_deref() {
+        question.push(super::url_line(url, cur.card.meta.imported, q_area.width));
+    }
     frame.render_widget(Paragraph::new(question).wrap(Wrap { trim: false }), q_area);
     if app.review.revealed {
         frame.render_widget(Line::from("─ ─ ─").dim(), gap_area);
