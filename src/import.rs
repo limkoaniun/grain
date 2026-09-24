@@ -50,12 +50,15 @@ impl Fetcher for UreqFetcher {
             .get(url)
             .header("User-Agent", "grain")
             .call()
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(|e| anyhow!("{}", crate::sync::api::transport_reason(&e)))?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
             return Err(anyhow!("http {status}"));
         }
-        response.body_mut().read_to_string().map_err(|e| anyhow!("{e}"))
+        response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| anyhow!("{}", crate::sync::api::transport_reason(&e)))
     }
 }
 
@@ -243,11 +246,21 @@ fn push_tag_token<'a>(tokens: &mut Vec<Token<'a>>, body: &'a str) {
         tokens.push(Token::Close(name));
         return;
     }
-    let (body, self_closing) = match body.strip_suffix('/') {
-        Some(rest) => (rest.trim_end(), true),
-        None => (body, false),
+    let (open_body, self_closing) = match body.strip_suffix('/') {
+        Some(rest)
+            if rest.ends_with(char::is_whitespace)
+                || rest.ends_with('"')
+                || rest.ends_with('\'')
+                || rest.trim_end() == tag_name(rest) =>
+        {
+            (rest.trim_end(), true)
+        }
+        // An unquoted attribute ending in `/` (e.g. `src=http://x.com/`) is
+        // not self-closing: keep the full body, slash included, as a plain
+        // open tag.
+        _ => (body, false),
     };
-    let name = tag_name(body);
+    let name = tag_name(open_body);
     tokens.push(Token::Open(name));
     if self_closing {
         tokens.push(Token::Close(name));
@@ -275,7 +288,10 @@ fn heading_level(name: &str) -> Option<usize> {
     if name.len() == 2 {
         let bytes = name.as_bytes();
         if (bytes[0] == b'h' || bytes[0] == b'H') && bytes[1].is_ascii_digit() {
-            return Some((bytes[1] - b'0') as usize);
+            let level = (bytes[1] - b'0') as usize;
+            if (1..=6).contains(&level) {
+                return Some(level);
+            }
         }
     }
     None
@@ -357,7 +373,10 @@ pub fn html_to_markdown(html: &str) -> (Option<String>, String) {
     let mut skip_depth: usize = 0;
     let mut skip_stack: Vec<&str> = Vec::new();
 
-    let flush = |paragraphs: &mut Vec<String>, current: &mut String, prefix: &mut Option<String>| {
+    let flush = |paragraphs: &mut Vec<String>,
+                 current: &mut String,
+                 prefix: &mut Option<String>,
+                 keep_prefix_when_empty: bool| {
         let collapsed = decode_and_collapse(current);
         let trimmed = collapsed.trim();
         if !trimmed.is_empty() {
@@ -366,7 +385,7 @@ pub fn html_to_markdown(html: &str) -> (Option<String>, String) {
                 None => trimmed.to_string(),
             };
             paragraphs.push(text);
-        } else {
+        } else if !keep_prefix_when_empty {
             prefix.take();
         }
         current.clear();
@@ -389,13 +408,13 @@ pub fn html_to_markdown(html: &str) -> (Option<String>, String) {
                     continue;
                 }
                 if let Some(level) = heading_level(name) {
-                    flush(&mut paragraphs, &mut current, &mut current_prefix);
+                    flush(&mut paragraphs, &mut current, &mut current_prefix, false);
                     current_prefix = Some(format!("{} ", "#".repeat(level)));
                 } else if name_is(name, "li") {
-                    flush(&mut paragraphs, &mut current, &mut current_prefix);
+                    flush(&mut paragraphs, &mut current, &mut current_prefix, false);
                     current_prefix = Some("- ".to_string());
                 } else if name_in(name, BLOCK_TAGS) {
-                    flush(&mut paragraphs, &mut current, &mut current_prefix);
+                    flush(&mut paragraphs, &mut current, &mut current_prefix, true);
                 }
                 // Other tags: no boundary, no output for the tag itself.
             }
@@ -409,7 +428,7 @@ pub fn html_to_markdown(html: &str) -> (Option<String>, String) {
                 }
                 if heading_level(name).is_some() || name_is(name, "li") || name_in(name, BLOCK_TAGS)
                 {
-                    flush(&mut paragraphs, &mut current, &mut current_prefix);
+                    flush(&mut paragraphs, &mut current, &mut current_prefix, false);
                 }
             }
         }
@@ -423,7 +442,7 @@ pub fn html_to_markdown(html: &str) -> (Option<String>, String) {
         current.clear();
         current_prefix = None;
     }
-    flush(&mut paragraphs, &mut current, &mut current_prefix);
+    flush(&mut paragraphs, &mut current, &mut current_prefix, false);
 
     let mut body = paragraphs.join("\n\n");
     if !body.is_empty() {
@@ -531,5 +550,42 @@ mod tests {
     fn html_unclosed_drop_tag_does_not_swallow_earlier_text() {
         let (_, body) = html_to_markdown("<p>a</p><script>x");
         assert_eq!(body, "a\n");
+    }
+
+    #[test]
+    fn li_prefix_survives_an_inner_block() {
+        let (_, body) = html_to_markdown("<ul><li><p>x</p></li></ul>");
+        assert_eq!(body, "- x\n");
+        let (_, body) = html_to_markdown("<li>a<p>b</p></li>");
+        assert_eq!(body, "- a\n\nb\n");
+        // An empty item does not leak its prefix onto the next paragraph.
+        let (_, body) = html_to_markdown("<li></li><p>y</p>");
+        assert_eq!(body, "y\n");
+    }
+
+    #[test]
+    fn only_h1_to_h6_are_headings() {
+        let (_, body) = html_to_markdown("<h0>x</h0>");
+        assert_eq!(body, "x\n");
+        let (_, body) = html_to_markdown("<h7>x</h7>");
+        assert_eq!(body, "x\n");
+        let (_, body) = html_to_markdown("<h6>x</h6>");
+        assert_eq!(body, "###### x\n");
+    }
+
+    #[test]
+    fn unquoted_attribute_ending_in_slash_is_not_self_closing() {
+        // The iframe's opening tag is not self-closing, so it is a normal
+        // open tag whose (dropped) content runs until `</iframe>`.
+        let (_, body) =
+            html_to_markdown("<p>a</p><iframe src=http://x.com/>hidden</iframe><p>b</p>");
+        assert_eq!(body, "a\n\nb\n");
+        // Self-closing forms (trailing-space, quoted-attribute) are still recognised.
+        let (_, body) = html_to_markdown("<p>a</p><br/><img src=\"a\"/><p>b</p>");
+        assert_eq!(body, "a\n\nb\n");
+        // `<svg />` self-closes, so the following `x` is plain text and `<p>`
+        // starts a new paragraph.
+        let (_, body) = html_to_markdown("<p>a</p><svg />x<p>b</p>");
+        assert_eq!(body, "a\n\nx\n\nb\n");
     }
 }

@@ -955,6 +955,28 @@ mod tests {
     }
 
     #[test]
+    fn read_shows_url_line_above_the_empty_note() {
+        let (_d, app) = app_with_file(
+            "empty-import.md",
+            "---\ntype: article\nurl: https://example.com/\nimported: 2026-09-20\n---\n",
+        );
+        let r = rows(&app);
+        assert_eq!(r[2].trim(), "↗ example.com/ · 2026-09-20", "{r:?}");
+        assert!(
+            r.iter().skip(3).any(|l| l.contains("article is empty")),
+            "note box below the url line: {r:?}"
+        );
+    }
+
+    #[test]
+    fn read_empty_article_without_url_unchanged() {
+        let (_d, app) = app_with_file("empty.md", "---\ntype: article\n---\n");
+        let r = rows(&app);
+        assert!(!r.iter().any(|l| l.contains('↗')), "no url line: {r:?}");
+        assert!(r.iter().any(|l| l.contains("article is empty")), "{r:?}");
+    }
+
+    #[test]
     fn reference_line_truncates_long_url() {
         let long = format!("https://example.org/{}", "a".repeat(200));
         let (_d, app) = app_with_file(
@@ -998,5 +1020,10 @@ mod tests {
         draw_tiny(&card_app);
         let (_art_dir, art_app) = app_with_file("art.md", URL_ARTICLE);
         draw_tiny(&art_app);
+        let (_empty_dir, empty_app) = app_with_file(
+            "empty-import.md",
+            "---\ntype: article\nurl: https://example.com/\nimported: 2026-09-20\n---\n",
+        );
+        draw_tiny(&empty_app);
     }
 }

@@ -242,20 +242,39 @@ impl Scheduler for UreqScheduler {
     }
 }
 
-fn transport_error(e: ureq::Error) -> ApiError {
-    let reason = match &e {
+/// Short, one-line reason for a transport failure. Shared by `sync` and `import`
+/// so both status lines read the same for the same underlying error.
+pub fn transport_reason(e: &ureq::Error) -> String {
+    match e {
         ureq::Error::Io(io) => match io.kind() {
             std::io::ErrorKind::ConnectionRefused => "connection refused".to_string(),
             std::io::ErrorKind::ConnectionReset => "connection reset".to_string(),
             std::io::ErrorKind::TimedOut => "timed out".to_string(),
-            _ => io.to_string(),
+            _ => {
+                let message = io.to_string();
+                // ureq 3.4.2's resolver turns a getaddrinfo failure into an
+                // uncategorised `io::Error` (resolver.rs `addr.to_socket_addrs()?`),
+                // with a stable message prefix and a platform-specific tail
+                // (macOS: "nodename nor servname provided, or not known";
+                // glibc: "Name or service not known"). Match the prefix only.
+                if message.starts_with("failed to lookup address information") {
+                    "host not found".to_string()
+                } else {
+                    message
+                }
+            }
         },
         ureq::Error::Timeout(_) => "timed out".to_string(),
         ureq::Error::HostNotFound => "host not found".to_string(),
         ureq::Error::ConnectionFailed => "connection failed".to_string(),
         other => other.to_string(),
-    };
-    ApiError::Unreachable { reason }
+    }
+}
+
+fn transport_error(e: ureq::Error) -> ApiError {
+    ApiError::Unreachable {
+        reason: transport_reason(&e),
+    }
 }
 
 fn reason_phrase(status: u16) -> String {
@@ -497,6 +516,40 @@ mod tests {
         let err = client.review(&review_req()).unwrap_err();
         assert!(matches!(err, ApiError::Unreachable { .. }), "never reached the server: {err:?}");
         assert_eq!(err.summary(), "connection refused");
+    }
+
+    #[test]
+    fn transport_reason_is_short_for_known_variants() {
+        assert_eq!(transport_reason(&ureq::Error::HostNotFound), "host not found");
+        assert_eq!(transport_reason(&ureq::Error::ConnectionFailed), "connection failed");
+        assert_eq!(
+            transport_reason(&ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
+            "connection refused"
+        );
+        assert_eq!(
+            transport_reason(&ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut))),
+            "timed out"
+        );
+        let other = transport_reason(&ureq::Error::Io(std::io::Error::other("boom")));
+        assert!(other.contains("boom"), "{other}");
+    }
+
+    #[test]
+    fn transport_reason_recognizes_dns_lookup_failures_as_host_not_found() {
+        // macOS tail.
+        assert_eq!(
+            transport_reason(&ureq::Error::Io(std::io::Error::other(
+                "failed to lookup address information: nodename nor servname provided, or not known"
+            ))),
+            "host not found"
+        );
+        // glibc tail.
+        assert_eq!(
+            transport_reason(&ureq::Error::Io(std::io::Error::other(
+                "failed to lookup address information: Name or service not known"
+            ))),
+            "host not found"
+        );
     }
 
     #[test]
