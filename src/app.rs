@@ -2,6 +2,7 @@
 //! review session. Rendering lives in `ui`; persistence lives in `db`;
 //! HTTP lives on the sync worker thread and reaches here only through `tick`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -13,9 +14,10 @@ use ratatui_image::picker::Picker;
 
 use crate::db::{Db, ItemRow, Schedule};
 use crate::media::{
-    kind_of, load_side, Audio, Media, MediaIndex, MediaKind, RodioAudio, SideMedia, IMAGE_ROWS,
+    kind_of, load_embed, load_side, Audio, Media, MediaIndex, MediaKind, RodioAudio, SideMedia,
+    IMAGE_ROWS,
 };
-use crate::vault::card::Segment;
+use crate::vault::card::{parse_embed, Segment};
 use crate::vault::article::{self, Paragraph, Span};
 use crate::vault::frontmatter::Document;
 use crate::sync::api::{Identity, Scheduler, API_KEY_ENV};
@@ -48,6 +50,8 @@ pub const DEFAULT_A_FACTOR: f64 = 1.5;
 const A_FACTOR_RANGE: (f64, f64) = (1.01, 5.0);
 /// Step of a `j`/`k` nudge in the priority prompt.
 const PRIO_NUDGE: i64 = 5;
+/// The read screen's left gutter; mirrors `ui::read::GUTTER`.
+const READ_GUTTER: u16 = 2;
 
 /// The next reading interval in days (M2, the SuperMemo topic rule computed locally):
 /// the first interval scales with priority, 1 day at `prio` 0 to 30 at 100; every later
@@ -71,7 +75,7 @@ pub enum Selection {
 }
 
 /// The article open on the read screen.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Read {
     pub item: ItemRow,
     pub body: String,
@@ -85,6 +89,8 @@ pub struct Read {
     pub selection: Option<Selection>,
     /// Spans of the body already harvested by children, for dim marks.
     pub children: Vec<Span>,
+    /// Media of the paragraphs that are nothing but one embed line, by paragraph index.
+    pub media: BTreeMap<usize, Media>,
 }
 
 impl Read {
@@ -530,8 +536,8 @@ impl App {
     }
 
     /// Remember the terminal size. A changed width means a changed image box, so the
-    /// card on screen is encoded again — the sides already loaded, and nothing else:
-    /// re-encoding never replays a sound.
+    /// card and the article on screen are encoded again — the sides already loaded,
+    /// and nothing else: re-encoding never replays a sound.
     pub fn set_viewport(&mut self, cols: u16, rows: u16) {
         let resized = self.viewport.0 != cols;
         self.viewport = (cols, rows);
@@ -547,6 +553,10 @@ impl App {
                 cur.media.answer =
                     load_side(&self.picker, &self.media_index, &cur.card.body.answer, image_box);
             }
+        }
+        let read_media = self.read.as_ref().map(|r| self.read_media(&r.body, &r.paragraphs));
+        if let (Some(r), Some(media)) = (self.read.as_mut(), read_media) {
+            r.media = media;
         }
     }
 
@@ -1078,6 +1088,7 @@ impl App {
         let cursor = article::paragraph_at(&paragraphs, item.read_pos.unwrap_or(0).max(0) as usize);
         let words = paragraphs.get(cursor).map(|p| article::words(&body, p)).unwrap_or_default();
         let children = self.children_spans(&item.path)?;
+        let media = self.read_media(&body, &paragraphs);
         self.read = Some(Read {
             item,
             body,
@@ -1087,9 +1098,39 @@ impl App {
             words,
             selection: None,
             children,
+            media,
         });
         self.screen = Screen::Read;
         Ok(())
+    }
+
+    /// Load the media of every paragraph that is one embed line and nothing else.
+    ///
+    /// A paragraph with more than one line is prose, even when an embed is in it:
+    /// the read screen wraps it as text, so there is nowhere to draw a picture.
+    fn read_media(&self, body: &str, paragraphs: &[Paragraph]) -> BTreeMap<usize, Media> {
+        let image_box = self.read_image_box();
+        let mut media = BTreeMap::new();
+        for (i, p) in paragraphs.iter().enumerate() {
+            let text = p.text(body);
+            if text.contains('\n') {
+                continue;
+            }
+            if let Some(embed) = parse_embed(text) {
+                let m = load_embed(&self.picker, &self.media_index, &embed.target, image_box);
+                media.insert(i, m);
+            }
+        }
+        media
+    }
+
+    /// The box a read-screen image is encoded into: the content width less the
+    /// gutter, [`IMAGE_ROWS`] tall.
+    fn read_image_box(&self) -> Size {
+        Size {
+            width: self.viewport.0.saturating_sub(READ_GUTTER),
+            height: IMAGE_ROWS,
+        }
     }
 
     /// Harvested spans of the article at `path`, from the index.
@@ -3501,6 +3542,126 @@ mod tests {
                 assert_eq!(*note, None, "a plain placeholder, not a failure");
             }
             other => panic!("expected an image, got {other:?}"),
+        }
+    }
+
+    // ---- M7 read-screen media ----
+
+    /// An article whose second paragraph is an embed of `target`, `type: article`
+    /// so the queue lists it and `open_article` can reach it.
+    fn pic_article(target: &str) -> String {
+        format!("---\ntype: article\n---\n# T\n\n![[{target}]]\n")
+    }
+
+    #[test]
+    fn opening_an_article_encodes_its_picture_paragraphs() {
+        let (_d, mut app, _log) = media_app(&[]);
+
+        open_article(&mut app, "earl-grey.md");
+
+        let r = read(&app);
+        assert_eq!(r.paragraphs.len(), 3, "heading, sentence, embed");
+        assert_eq!(r.media.keys().copied().collect::<Vec<_>>(), vec![2], "only the embed paragraph");
+        match &r.media[&2] {
+            Media::Image { target, protocol, note } => {
+                assert_eq!(target, "buddhas-hand.jpg");
+                assert!(protocol.is_some(), "encoded for the read box");
+                assert_eq!(*note, None);
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn viewport_unset_leaves_no_protocol() {
+        let dir = media_vault(&[]);
+        let mut app = App::open(dir.path(), today()).unwrap();
+        app.set_picker(test_picker());
+        let (audio, _log) = NullAudio::new();
+        app.set_audio(Box::new(audio));
+
+        open_article(&mut app, "earl-grey.md");
+
+        match &read(&app).media[&2] {
+            Media::Image { protocol, note, .. } => {
+                assert!(protocol.is_none(), "no viewport, no room, no encode");
+                assert_eq!(*note, None, "a plain placeholder, not a failure");
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extracting_the_picture_paragraph_makes_a_child_with_the_picture() {
+        let (dir, mut app, _log) = media_app(&[]);
+        open_article(&mut app, "earl-grey.md");
+        press(&mut app, 'j');
+        press(&mut app, 'j');
+        assert_eq!(read(&app).cursor, 2, "the embed paragraph");
+
+        ctrl(&mut app, 'x');
+
+        assert_eq!(app.notice.as_deref(), Some("extracted → earl-grey/1.md"));
+        let text = file(&dir, "earl-grey/1.md");
+        assert!(text.ends_with("---\n![[buddhas-hand.jpg]]\n"), "{text}");
+
+        open_article(&mut app, "earl-grey/1.md");
+        let r = read(&app);
+        assert_eq!(r.paragraphs.len(), 1);
+        match &r.media[&0] {
+            Media::Image { protocol, note, .. } => {
+                assert!(protocol.is_some(), "the child shows the same picture");
+                assert_eq!(*note, None);
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_viewport_width_change_reencodes_read_media() {
+        let (_d, mut app, _log) = media_app(&[]);
+        open_article(&mut app, "earl-grey.md");
+
+        app.set_viewport(60, 24);
+
+        let narrow = match &read(&app).media[&2] {
+            Media::Image { protocol: Some(p), .. } => p.size(),
+            other => panic!("expected an encoded image, got {other:?}"),
+        };
+        assert!(narrow.width <= 58, "{narrow:?} fits the 60-column box less the gutter");
+
+        app.set_viewport(60, 30);
+
+        match &read(&app).media[&2] {
+            Media::Image { protocol: Some(p), .. } => {
+                assert_eq!(p.size(), narrow, "a height-only change re-encodes nothing");
+            }
+            other => panic!("expected an encoded image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_picture_is_noted() {
+        let (gone, sound) = (pic_article("nope.png"), pic_article("pomelo.mp3"));
+        let (_d, mut app, _log) = media_app(&[("gone.md", &gone), ("sound.md", &sound)]);
+
+        open_article(&mut app, "gone.md");
+        match &read(&app).media[&1] {
+            Media::Image { protocol, note, .. } => {
+                assert!(protocol.is_none());
+                assert_eq!(*note, Some("not found"));
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+
+        open_article(&mut app, "sound.md");
+        match &read(&app).media[&1] {
+            Media::Audio { target, path, failed } => {
+                assert_eq!(target, "pomelo.mp3");
+                assert_eq!(path.as_deref(), Some("media/pomelo.mp3"));
+                assert!(!failed);
+            }
+            other => panic!("expected audio, got {other:?}"),
         }
     }
 }

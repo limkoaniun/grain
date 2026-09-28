@@ -8,10 +8,11 @@ mod read;
 mod review;
 
 use chrono::NaiveDate;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Widget, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, Phase, Screen, TextStage};
@@ -210,6 +211,32 @@ pub(crate) fn note_box(frame: &mut Frame, area: Rect, lines: &[Line], status: Op
     }
 }
 
+pub(super) fn wrapped<'a>(lines: Vec<Line<'a>>) -> Paragraph<'a> {
+    Paragraph::new(lines).wrap(Wrap { trim: false })
+}
+
+/// The rows `lines` take inside `area`, wrapped exactly as they will be drawn.
+///
+/// `Paragraph::line_count` is behind ratatui's unstable `rendered-line-info`
+/// feature, so the widget answers instead of a second wrapping of our own: the same
+/// `Paragraph` is drawn into a scratch buffer the size of the side, and the last row
+/// carrying a character is the last row the text needs. Rows that stay blank are
+/// free for a picture.
+pub(super) fn text_rows(lines: &[Line<'_>], area: Rect) -> u16 {
+    if area.width == 0 || area.height == 0 {
+        return 0;
+    }
+    let scratch_area = Rect::new(0, 0, area.width, area.height);
+    let mut scratch = Buffer::empty(scratch_area);
+    wrapped(lines.to_vec()).render(scratch_area, &mut scratch);
+    (0..area.height)
+        .rev()
+        .find(|&y| {
+            (0..area.width).any(|x| scratch.cell((x, y)).is_some_and(|c| c.symbol() != " "))
+        })
+        .map_or(0, |y| y + 1)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -218,9 +245,10 @@ mod tests {
     use crate::app::App;
     use crate::media::{test_picker, AudioLog, NullAudio};
     use chrono::NaiveDate;
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::style::Modifier;
     use ratatui::Terminal;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -406,6 +434,25 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| render(f, app)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn text_rows_counts_wrapped_rows_exactly() {
+        let long = Line::from("a".repeat(100));
+        assert_eq!(text_rows(&[long], Rect::new(0, 0, 40, 10)), 3, "100 chars at width 40 wrap to 3 rows");
+
+        let two = [Line::from("0123456789"), Line::from("0123456789")];
+        assert_eq!(text_rows(&two, Rect::new(0, 0, 40, 10)), 2, "two short lines take one row each");
+
+        assert_eq!(text_rows(&[], Rect::new(0, 0, 40, 10)), 0, "no lines, no rows");
+        assert_eq!(text_rows(&[Line::from("x")], Rect::new(0, 0, 0, 10)), 0, "zero width");
+
+        let over = Line::from("a".repeat(1000));
+        assert_eq!(
+            text_rows(&[over], Rect::new(0, 0, 10, 5)),
+            5,
+            "a line longer than the area clamps to its height"
+        );
     }
 
     #[test]
@@ -771,6 +818,106 @@ mod tests {
         app.handle_key(KeyCode::Char(' ')).unwrap();
         let all = rows(&app).join("\n");
         assert!(all.contains("♪ ghost.mp3 · not found"), "{all}");
+    }
+
+    /// A cloze child as `Ctrl+z` writes it: one `[...]` in the question, the
+    /// hidden words as the answer.
+    const CLOZE: (&str, &str) =
+        ("cloze.md", "---\ntype: card\n---\nQ: Pomelo is the [...] citrus fruit.\n\nA: largest\n");
+
+    /// Two blanks and a two-line answer: only the first of each is used.
+    const CLOZE_TWO: (&str, &str) =
+        ("cloze-two.md", "---\ntype: card\n---\nQ: [...] and [...]\n\nA: one\ntwo\n");
+
+    /// Is the cell at `(x, y)` a filled-in blank: amber and bold?
+    fn amber_bold(buf: &Buffer, x: u16, y: u16) -> bool {
+        buf.cell((x, y))
+            .is_some_and(|c| c.fg == AMBER && c.modifier.contains(Modifier::BOLD))
+    }
+
+    #[test]
+    fn cloze_question_keeps_the_blank_before_reveal() {
+        let (_d, mut app, _log) = media_app(&[CLOZE]);
+        open_card(&mut app, "cloze.md");
+        let r = rows(&app);
+        let y = r
+            .iter()
+            .position(|l| l.contains("Pomelo is the [...] citrus fruit."))
+            .unwrap_or_else(|| panic!("the blank stays before the reveal: {r:?}"))
+            as u16;
+        let buf = buffer(&app);
+        assert!(
+            (0..buf.area.width).all(|x| !amber_bold(&buf, x, y)),
+            "nothing is filled in before the reveal: {r:?}"
+        );
+    }
+
+    #[test]
+    fn cloze_question_fills_the_blank_on_reveal() {
+        let (_d, mut app, _log) = media_app(&[CLOZE]);
+        open_card(&mut app, "cloze.md");
+        app.handle_key(KeyCode::Char(' ')).unwrap();
+        let r = rows(&app);
+        let y = r
+            .iter()
+            .position(|l| l.contains("Pomelo is the largest citrus fruit."))
+            .unwrap_or_else(|| panic!("the blank is filled at the reveal: {r:?}"));
+        // The row is ASCII, so the byte offset is the column.
+        let fill = r[y].find("largest").unwrap() as u16;
+        let text = r[y].find("Pomelo").unwrap() as u16;
+        let buf = buffer(&app);
+        let y = y as u16;
+        for i in 0.."largest".len() as u16 {
+            assert!(amber_bold(&buf, fill + i, y), "the fill is amber bold: {r:?}");
+        }
+        assert!(!amber_bold(&buf, text, y), "the rest of the line is untouched: {r:?}");
+        assert!(
+            !amber_bold(&buf, fill + "largest".len() as u16, y),
+            "only the answer is styled: {r:?}"
+        );
+
+        let dash = r.iter().position(|l| l.contains("─ ─ ─")).unwrap();
+        assert!(
+            r.iter().skip(dash + 1).any(|l| l.trim() == "largest"),
+            "the answer area still shows the answer: {r:?}"
+        );
+    }
+
+    #[test]
+    fn cloze_fill_uses_first_blank_and_first_answer_line() {
+        let (_d, mut app, _log) = media_app(&[CLOZE_TWO]);
+        open_card(&mut app, "cloze-two.md");
+        app.handle_key(KeyCode::Char(' ')).unwrap();
+        let r = rows(&app);
+        let y = r
+            .iter()
+            .position(|l| l.trim() == "one and [...]")
+            .unwrap_or_else(|| panic!("the first blank takes the first answer line: {r:?}"));
+        let fill = r[y].find("one").unwrap() as u16;
+        let rest = r[y].find("and").unwrap() as u16;
+        let second = r[y].find("[...]").unwrap() as u16;
+        let buf = buffer(&app);
+        let y = y as u16;
+        for i in 0..3 {
+            assert!(amber_bold(&buf, fill + i, y), "`one` is amber bold: {r:?}");
+        }
+        assert!(!amber_bold(&buf, rest, y), "`and` is untouched: {r:?}");
+        assert!(!amber_bold(&buf, second, y), "the second blank stays: {r:?}");
+    }
+
+    #[test]
+    fn non_cloze_card_is_untouched_on_reveal() {
+        let (_d, mut app, _log) = media_app(&[]);
+        open_card(&mut app, "pomelo.md");
+        app.handle_key(KeyCode::Char(' ')).unwrap();
+        let r = rows(&app);
+        let y = r.iter().position(|l| l.contains("Large citrus fruit")).unwrap() as u16;
+        let buf = buffer(&app);
+        assert!(
+            (0..buf.area.width).all(|x| !amber_bold(&buf, x, y)),
+            "a card without a blank is unchanged: {r:?}"
+        );
+        assert!(r.join("\n").contains("pomelo /ˈpɒmɪloʊ/"), "the answer still shows: {r:?}");
     }
 
     #[test]
@@ -1266,5 +1413,163 @@ mod tests {
         }
         media.handle_key(KeyCode::Char(' ')).unwrap();
         draw_tiny(&media);
+
+        // M7: an article whose last paragraph is a picture, with the cursor on it.
+        let (_read_dir, mut read_media, _read_log) = media_app(&[]);
+        open_card(&mut read_media, "earl-grey.md");
+        read_media.handle_key(KeyCode::Char('j')).unwrap();
+        read_media.handle_key(KeyCode::Char('j')).unwrap();
+        draw_tiny(&read_media);
+        let mut terminal = Terminal::new(TestBackend::new(80, 3)).unwrap();
+        terminal.draw(|f| render(f, &read_media)).unwrap();
+    }
+
+    // ---- M7: pictures on the read screen ----
+
+    /// The first row of the rendered buffer that carries image cells.
+    fn first_image_row(buf: &Buffer) -> Option<u16> {
+        (0..buf.area.height).find(|&y| image_cells(buf, y, y) > 0)
+    }
+
+    /// An article whose paragraphs are `# T`, then `extra`, as a one-file vault.
+    fn embed_article(extra: &str) -> String {
+        format!("---\ntype: article\nsm_id: 80\nprio: 5\n---\n# T\n\n{extra}")
+    }
+
+    #[test]
+    fn read_draws_a_picture_paragraph_in_the_flow() {
+        let (_d, mut app, _log) = media_app(&[]);
+        open_card(&mut app, "earl-grey.md");
+        let buf = buffer_at(&app, 80, 24);
+        let r = rows_of(&buf);
+        assert!(r[2].contains("# Earl Grey"), "the heading is the first body row: {r:?}");
+        assert!(r[4].contains("Earl Grey is a tea blend"), "the sentence follows it: {r:?}");
+        assert!(
+            !r.iter().any(|l| l.contains("![[buddhas-hand.jpg]]")),
+            "the embed line is never shown as text: {r:?}"
+        );
+        assert!(image_cells(&buf, 4, 14) >= 1, "the picture is drawn under the text: {r:?}");
+        assert_eq!(image_cells(&buf, 0, 4), 0, "and never over it: {r:?}");
+    }
+
+    #[test]
+    fn read_picture_paragraph_gets_the_gutter_mark() {
+        let (_d, mut app, _log) = media_app(&[]);
+        open_card(&mut app, "earl-grey.md");
+
+        // The cursor starts on the heading, so the picture's gutter is blank.
+        let buf = buffer_at(&app, 80, 24);
+        let r = rows_of(&buf);
+        let heading = r.iter().position(|l| l.contains("# Earl Grey")).unwrap();
+        assert!(r[heading].starts_with("▎ "), "the bar is on the heading: {r:?}");
+        let y = first_image_row(&buf).unwrap();
+        assert_eq!(buf[(0, y)].symbol(), " ", "no mark on a picture the cursor is not on");
+
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        assert_eq!(app.read.as_ref().unwrap().cursor, 2, "the cursor is on the embed paragraph");
+        let buf = buffer_at(&app, 80, 24);
+        let y = first_image_row(&buf).unwrap();
+        assert_eq!(buf[(0, y)].symbol(), "▎", "the bar moves onto the picture");
+        assert_eq!(buf[(0, y)].style().fg, Some(AMBER), "and it is amber");
+    }
+
+    #[test]
+    fn read_harvested_picture_shows_a_dot() {
+        let (_d, mut app, _log) = media_app(&[]);
+        open_card(&mut app, "earl-grey.md");
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        app.handle_key_with(KeyCode::Char('x'), KeyModifiers::CONTROL).unwrap();
+        app.handle_key(KeyCode::Char('k')).unwrap();
+
+        let buf = buffer_at(&app, 80, 24);
+        let y = first_image_row(&buf).unwrap();
+        assert_eq!(buf[(0, y)].symbol(), "•", "a harvested picture gets the dot");
+        assert!(
+            buf[(0, y)].style().add_modifier.contains(Modifier::DIM),
+            "the dot is dim"
+        );
+    }
+
+    #[test]
+    fn read_missing_picture_shows_placeholder_in_flow() {
+        let (_d, app, _log) = solo_media_app(&[("t.md", &embed_article("text\n\n![[nope.png]]\n"))]);
+        assert_eq!(app.read.as_ref().unwrap().item.path, "t.md");
+        let buf = buffer_at(&app, 80, 24);
+        let r = rows_of(&buf);
+        let y = r
+            .iter()
+            .position(|l| l.contains("[image: nope.png · not found]"))
+            .unwrap_or_else(|| panic!("no placeholder row: {r:?}"));
+        assert_eq!(r[y], "  [image: nope.png · not found]", "gutter-prefixed: {r:?}");
+        assert!(
+            buf[(2, y as u16)].style().add_modifier.contains(Modifier::DIM),
+            "the placeholder is dim"
+        );
+        assert_eq!(image_cells(&buf, 0, 23), 0, "nothing is drawn: {r:?}");
+    }
+
+    #[test]
+    fn read_audio_and_other_embeds_are_one_dim_row() {
+        let (_d, mut app, log) =
+            solo_media_app(&[("t.md", &embed_article("![[pomelo.mp3]]\n\n![[x.svg]]\n"))]);
+        let buf = buffer_at(&app, 80, 24);
+        let r = rows_of(&buf);
+        let sound = r.iter().position(|l| l == "  ♪ pomelo.mp3").unwrap_or_else(|| panic!("{r:?}"));
+        let other = r.iter().position(|l| l == "  [embed: x.svg]").unwrap_or_else(|| panic!("{r:?}"));
+        assert!(
+            buf[(2, sound as u16)].style().add_modifier.contains(Modifier::DIM),
+            "the audio row is dim"
+        );
+        assert!(
+            buf[(2, other as u16)].style().add_modifier.contains(Modifier::DIM),
+            "the other-embed row is dim"
+        );
+        assert!(log.lock().unwrap().plays.is_empty(), "the read screen never plays a sound");
+
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        app.handle_key(KeyCode::Char('k')).unwrap();
+        assert!(log.lock().unwrap().plays.is_empty(), "moving the cursor plays nothing either");
+    }
+
+    #[test]
+    fn read_picture_without_room_falls_back_to_placeholder() {
+        let (_d, mut app, _log) = media_app(&[]);
+        open_card(&mut app, "earl-grey.md");
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        app.set_viewport(80, 6);
+
+        let buf = buffer_at(&app, 80, 6);
+        let r = rows_of(&buf);
+        assert!(
+            r.iter().any(|l| l.contains("[image: buddhas-hand.jpg]")),
+            "a picture with no room is the M0 placeholder again: {r:?}"
+        );
+        assert_eq!(image_cells(&buf, 0, 5), 0, "and nothing is drawn: {r:?}");
+    }
+
+    #[test]
+    fn read_scroll_keeps_the_cursor_picture_visible() {
+        let text: String = (1..=8).map(|i| format!("Paragraph {i}\n\n")).collect();
+        let body = format!(
+            "---\ntype: article\nsm_id: 82\nprio: 5\n---\n{text}![[buddhas-hand.jpg]]\n"
+        );
+        let (_d, mut app, _log) = solo_media_app(&[("long.md", &body)]);
+        assert_eq!(app.read.as_ref().unwrap().item.path, "long.md");
+        for _ in 0..8 {
+            app.handle_key(KeyCode::Char('j')).unwrap();
+        }
+        assert_eq!(app.read.as_ref().unwrap().cursor, 8, "the cursor is on the picture");
+
+        let buf = buffer_at(&app, 80, 24);
+        let r = rows_of(&buf);
+        let y = first_image_row(&buf).unwrap_or_else(|| panic!("no picture on screen: {r:?}"));
+        let last_text = r
+            .iter()
+            .position(|l| l.contains("Paragraph 8"))
+            .unwrap_or_else(|| panic!("no context above the picture: {r:?}"));
+        assert!(last_text < y as usize, "the last text paragraph sits above it: {r:?}");
     }
 }
