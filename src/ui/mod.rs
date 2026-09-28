@@ -6,6 +6,7 @@
 mod queue;
 mod read;
 mod review;
+mod stats;
 
 use chrono::NaiveDate;
 use ratatui::buffer::Buffer;
@@ -74,6 +75,12 @@ pub fn render(frame: &mut Frame, app: &App) {
                 read::HINTS
             };
             hints_row(frame, hints, text_hints.unwrap_or(base));
+        }
+        // No prompt can be open on the stats screen, so the hints never change.
+        Screen::Stats => {
+            status_row(frame, top, middle.as_deref(), &app.stats_context(), app.progress());
+            stats::render(frame, content, app);
+            hints_row(frame, hints, stats::HINTS);
         }
     }
 }
@@ -551,8 +558,8 @@ mod tests {
         assert!(r[23].contains("q quit"), "{:?}", r[23]);
         assert_eq!(
             r[23],
-            "j/k move · enter open · a add · i import · p prio · tab learn · q quit",
-            "p is a queue key (M2), a and i are M5"
+            "j/k move · enter open · a add · i import · s stats · p prio · tab learn · q quit",
+            "p is a queue key (M2), a and i are M5, s is M8"
         );
         assert!(!r.iter().any(|l| l.contains('│') || l.contains('┌')), "no borders");
     }
@@ -789,12 +796,12 @@ mod tests {
         open_card(&mut app, "pomelo.md");
         assert_eq!(
             rows(&app)[23],
-            "space reveal · 0-5 grade · u undo · r replay · tab queue · q quit"
+            "space reveal · 0-5 grade · u undo · r replay · tab queue · s stats · q quit"
         );
 
         // yuzu has no embeds at all.
         open_card(&mut app, "yuzu.md");
-        assert_eq!(rows(&app)[23], "space reveal · 0-5 grade · u undo · tab queue · q quit");
+        assert_eq!(rows(&app)[23], "space reveal · 0-5 grade · u undo · tab queue · s stats · q quit");
     }
 
     #[test]
@@ -1199,7 +1206,7 @@ mod tests {
         let all = r.join("\n");
         assert!(all.contains("Japanese citrus, fragrant, used in ponzu?"), "{all}");
         assert!(!r[1..23].iter().any(|l| l.starts_with("type")), "no table header: {r:?}");
-        assert_eq!(r[23], "space reveal · 0-5 grade · u undo · tab queue · q quit");
+        assert_eq!(r[23], "space reveal · 0-5 grade · u undo · tab queue · s stats · q quit");
     }
 
     #[test]
@@ -1209,7 +1216,7 @@ mod tests {
         let title = r.iter().position(|l| l.contains("nothing more to learn")).unwrap();
         let counts = r.iter().position(|l| l.contains("0 graded · 0 read")).unwrap();
         assert_eq!(counts, title + 1, "the counts sit on their own row under the title: {r:?}");
-        assert_eq!(r[23], "tab queue · q quit");
+        assert_eq!(r[23], "tab queue · s stats · q quit");
     }
 
     #[test]
@@ -1258,7 +1265,7 @@ mod tests {
         let r = rows(&app);
         assert_eq!(
             r[23],
-            "j/k move · enter open · a add · i import · p prio · tab learn · q quit"
+            "j/k move · enter open · a add · i import · s stats · p prio · tab learn · q quit"
         );
         let add = r[23].find("a add").unwrap();
         let import = r[23].find("i import").unwrap();
@@ -1571,5 +1578,176 @@ mod tests {
             .position(|l| l.contains("Paragraph 8"))
             .unwrap_or_else(|| panic!("no context above the picture: {r:?}"));
         assert!(last_text < y as usize, "the last text paragraph sits above it: {r:?}");
+    }
+
+    // ---- M8: the stats screen ----
+
+    /// The fixture vault with the stats screen open, reached from the table.
+    fn stats_app() -> (tempfile::TempDir, App) {
+        let (dir, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        app.handle_key(KeyCode::Char('s')).unwrap();
+        assert_eq!(app.screen, Screen::Stats);
+        (dir, app)
+    }
+
+    /// The rendered rows that belong to the calendar: the whole window is September
+    /// 2026, so a date is how a calendar row starts.
+    fn calendar_rows(r: &[String]) -> Vec<String> {
+        r.iter()
+            .filter(|l| l.trim_start_matches(['▎', ' ']).starts_with("09-"))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn stats_screen_shows_the_fixture_numbers_and_calendar() {
+        let (_d, app) = stats_app();
+        let screen = at(&app, 80, 24);
+        for field in [
+            "first day    —",
+            "memorized    4 · pending 4 · dismissed 0 burden",
+            "repetitions  — · 0 total",
+            "lapses       — · 0 today",
+            "outstanding  4+2",
+            "burden       1.57 + 0.00 /day",
+            "measured FI  —",
+            "interval     6.0 d (I) · — (T)",
+        ] {
+            assert!(screen.contains(field), "missing {field:?} in\n{screen}");
+        }
+
+        let r = rows(&app);
+        let buf = buffer(&app);
+        assert!(r[0].ends_with("stats · 8 items"), "{:?}", r[0]);
+        assert_eq!(r[23], "s/esc back · q quit");
+        assert_eq!(buf[(0, 23)].style().fg, Some(AMBER), "the hint key is amber");
+
+        // Four number rows, one blank, then the calendar. The left column's widest
+        // value fills its half exactly, so the right column carries a one-cell pad.
+        assert_eq!(
+            r[3],
+            "memorized    4 · pending 4 · dismissed 0 burden       1.57 + 0.00 /day",
+            "the columns keep a gap at 80: {r:?}"
+        );
+        assert_eq!(r[6], "", "one blank row under the numbers: {r:?}");
+        let cal = calendar_rows(&r);
+        assert_eq!(cal.len(), 15, "15 calendar rows at 80x24: {r:?}");
+        assert!(cal[0].contains("09-13 Sun"), "first calendar row: {:?}", cal[0]);
+        assert!(cal[14].contains("09-27 Sun"), "last calendar row: {:?}", cal[14]);
+        assert!(!screen.contains("09-30"), "09-30 is outside the window:\n{screen}");
+
+        // Today: amber gutter bar, amber date, one `▮` per due item and the count.
+        let y = r.iter().position(|l| l.contains("09-20 Sun")).unwrap() as u16;
+        assert_eq!(r[y as usize], "▎ 09-20 Sun  ▮▮▮▮▮▮ 6", "{r:?}");
+        assert_eq!(cal[7], r[y as usize], "today sits in the middle of the window");
+        assert_eq!(buf[(0, y)].symbol(), "▎");
+        assert_eq!(buf[(0, y)].style().fg, Some(AMBER), "the gutter bar is amber");
+        assert_eq!(buf[(2, y)].style().fg, Some(AMBER), "today's date is amber");
+
+        // A future day with one due item, and a zero day with no bar at all.
+        let y = r.iter().position(|l| l.contains("09-25 Fri")).unwrap() as u16;
+        assert_eq!(r[y as usize], "  09-25 Fri  ▮ 1", "{r:?}");
+        assert!(
+            !buf[(2, y)].style().add_modifier.contains(Modifier::DIM),
+            "a future date is plain"
+        );
+        let y = r.iter().position(|l| l.contains("09-21 Mon")).unwrap() as u16;
+        assert_eq!(r[y as usize], "  09-21 Mon  0", "a zero day has no bar: {r:?}");
+        assert!(
+            buf[(13, y)].style().add_modifier.contains(Modifier::DIM),
+            "the zero is dim"
+        );
+
+        // A past day is dim and carries no gutter bar.
+        let y = r.iter().position(|l| l.contains("09-13 Sun")).unwrap() as u16;
+        assert_eq!(buf[(0, y)].symbol(), " ", "no gutter bar off today");
+        assert!(
+            buf[(2, y)].style().add_modifier.contains(Modifier::DIM),
+            "a past date is dim"
+        );
+    }
+
+    #[test]
+    fn stats_screen_survives_tiny_sizes() {
+        let (_d, app) = stats_app();
+        draw_tiny(&app);
+
+        // Two content rows: the first two number rows of each column, no calendar.
+        let r = rows_of(&buffer_at(&app, 80, 6));
+        assert!(r[2].contains("first day") && r[2].contains("outstanding"), "{r:?}");
+        assert!(r[3].contains("memorized") && r[3].contains("burden"), "{r:?}");
+        assert!(!r[2].contains("repetitions"), "{r:?}");
+        assert!(calendar_rows(&r).is_empty(), "no room for the calendar: {r:?}");
+
+        // Six content rows: four number rows, the blank, and today alone.
+        let r = rows_of(&buffer_at(&app, 80, 10));
+        assert!(r[5].contains("lapses") && r[5].contains("interval"), "{r:?}");
+        assert_eq!(r[6], "", "{r:?}");
+        assert_eq!(calendar_rows(&r), vec!["▎ 09-20 Sun  ▮▮▮▮▮▮ 6".to_string()], "{r:?}");
+
+        // Narrow but not degenerate: the stacked block and a cut-down calendar row.
+        for (w, h) in [(20u16, 3u16), (40, 2), (3, 30), (12, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| render(f, &app)).unwrap();
+        }
+    }
+
+    #[test]
+    fn stats_screen_stacks_the_numbers_below_eighty_columns() {
+        let (_d, app) = stats_app();
+        let buf = buffer_at(&app, 70, 24);
+        let r = rows_of(&buf);
+
+        // Under 80 columns two halves would clip the widest value, so the eight
+        // fields take one row each in `fields()` order and nothing is cut.
+        assert_eq!(r[2], "first day    —", "{r:?}");
+        assert_eq!(r[3], "memorized    4 · pending 4 · dismissed 0", "{r:?}");
+        assert_eq!(r[4], "repetitions  — · 0 total", "{r:?}");
+        assert_eq!(r[5], "lapses       — · 0 today", "{r:?}");
+        assert_eq!(r[6], "outstanding  4+2", "{r:?}");
+        assert_eq!(r[7], "burden       1.57 + 0.00 /day", "{r:?}");
+        assert_eq!(r[8], "measured FI  —", "{r:?}");
+        assert_eq!(r[9], "interval     6.0 d (I) · — (T)", "{r:?}");
+        assert_eq!(r[10], "", "one blank row under the numbers: {r:?}");
+
+        // 20 content rows less the eight numbers and the blank: 5 past, today, 5 future.
+        let cal = calendar_rows(&r);
+        assert_eq!(cal.len(), 11, "{r:?}");
+        assert!(cal[0].contains("09-15 Tue"), "{:?}", cal[0]);
+        assert_eq!(cal[5], "▎ 09-20 Sun  ▮▮▮▮▮▮ 6", "today in the middle: {r:?}");
+        assert_eq!(cal[10], "  09-25 Fri  ▮ 1", "{r:?}");
+        let y = r.iter().position(|l| l.contains("09-20 Sun")).unwrap() as u16;
+        assert_eq!(buf[(0, y)].style().fg, Some(AMBER), "the gutter bar is still amber");
+        assert_eq!(buf[(2, y)].style().fg, Some(AMBER), "today's date is still amber");
+        assert!(r.iter().all(|l| l.chars().count() <= 70), "nothing overflows: {r:?}");
+    }
+
+    #[test]
+    fn queue_and_review_hints_offer_stats() {
+        let (_d, mut app) = fixture_app();
+        assert_eq!(
+            rows(&app)[23],
+            "space reveal · 0-5 grade · u undo · tab queue · s stats · q quit",
+            "the session offers stats before quit"
+        );
+
+        app.handle_key(KeyCode::Tab).unwrap();
+        let r = rows(&app);
+        assert_eq!(
+            r[23],
+            "j/k move · enter open · a add · i import · s stats · p prio · tab learn · q quit"
+        );
+        let import = r[23].find("i import").unwrap();
+        let stats = r[23].find("s stats").unwrap();
+        let prio = r[23].find("p prio").unwrap();
+        assert!(import < stats && stats < prio, "s stats follows i import: {:?}", r[23]);
+
+        // The drill prompt keeps its own keys; the finish line behind it offers stats.
+        let (_d2, mut app) = fixture_app();
+        walk_to_prompt(&mut app, ['2', '4', '4', '4']);
+        assert!(!rows(&app)[23].contains("s stats"), "{:?}", rows(&app)[23]);
+        app.handle_key(KeyCode::Char('n')).unwrap();
+        assert_eq!(rows(&app)[23], "tab queue · s stats · q quit");
     }
 }
