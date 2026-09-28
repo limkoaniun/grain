@@ -2,17 +2,24 @@
 //! the current paragraph and a dim dot on harvested ones, other paragraphs dim,
 //! `#` lines bold, harvested spans dim, the selection reversed, the cursor word
 //! underlined. Scrolls by whole paragraphs to keep the cursor visible.
+//!
+//! A paragraph that is nothing but one embed line is drawn as its media instead
+//! of as text (M7): a picture in the flow with the same gutter mark, or one dim
+//! placeholder row when there is no picture to draw.
 
 use ratatui::layout::Rect;
 // `Style`'s modifier helpers (`dim`, `reversed`, `underlined`) are inherent, so
 // `Stylize` is no longer needed here.
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
+use ratatui_image::protocol::Protocol;
+use ratatui_image::Image;
 
 use crate::app::{App, Read};
+use crate::media::Media;
 use crate::vault::article::Span as Offsets;
+use crate::vault::card::Embed;
 
 pub const HINTS: &[(&str, &str)] = &[
     ("j/k", "¶"),
@@ -67,18 +74,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         children: &read.children,
     };
 
+    let chunks: Vec<Chunk> =
+        (0..read.paragraphs.len()).map(|i| chunk_for(read, i, &marks, width)).collect();
+    let heights: Vec<usize> = chunks.iter().map(|c| usize::from(rows_of(c, area))).collect();
+
     // Scroll by whole paragraphs: start at the cursor and take as much context above as fits.
-    let rows_of = |i: usize| -> usize {
-        paragraph_lines(read, i, &marks)
-            .iter()
-            .map(|l| wrapped_rows(l.width(), width))
-            .sum()
-    };
     let height = area.height as usize;
-    let mut start = read.cursor;
-    let mut used = rows_of(start);
+    let mut start = read.cursor.min(chunks.len().saturating_sub(1));
+    let mut used = heights.get(start).copied().unwrap_or(0);
     while start > 0 {
-        let above = rows_of(start - 1) + 1;
+        let above = heights[start - 1] + 1;
         if used + above > height {
             break;
         }
@@ -86,31 +91,135 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         start -= 1;
     }
 
-    let mut lines: Vec<Line> = Vec::new();
-    for i in start..read.paragraphs.len() {
-        if i > start {
-            lines.push(Line::default());
+    // One blank row between paragraphs; stop as soon as the area is full.
+    let mut y = area.y;
+    for (i, chunk) in chunks.into_iter().enumerate().skip(start) {
+        if y >= area.bottom() {
+            break;
         }
-        lines.extend(paragraph_lines(read, i, &marks));
+        if i > start {
+            y += 1;
+            if y >= area.bottom() {
+                break;
+            }
+        }
+        let rows = heights[i] as u16;
+        let left = area.bottom() - y;
+        match chunk {
+            Chunk::Text(lines) => {
+                let rows = rows.min(left);
+                frame.render_widget(super::wrapped(lines), Rect { y, height: rows, ..area });
+                y += rows;
+            }
+            Chunk::Placeholder(line) => {
+                let rows = rows.min(left);
+                frame.render_widget(super::wrapped(vec![line]), Rect { y, height: rows, ..area });
+                y += rows;
+            }
+            Chunk::Picture { protocol, mark, target } => {
+                let size = protocol.size();
+                if size.height > left {
+                    // No room for the picture: back to the M0 placeholder line, and
+                    // nothing after it would fit anyway.
+                    let line = placeholder_line(mark, format!("[image: {target}]"));
+                    frame.render_widget(super::wrapped(vec![line]), Rect { y, height: 1, ..area });
+                    break;
+                }
+                let (text, style) = mark;
+                let gutter = Rect { x: area.x, y, width: GUTTER, height: 1 };
+                frame.render_widget(Line::from(Span::styled(text, style)), gutter);
+                let picture = Rect {
+                    x: area.x + GUTTER,
+                    y,
+                    width: size.width.min(width),
+                    height: size.height,
+                };
+                frame.render_widget(Image::new(protocol), picture);
+                y += size.height;
+            }
+        }
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// What one paragraph draws as: its styled text, a picture, or a single dim row.
+enum Chunk<'a> {
+    Text(Vec<Line<'a>>),
+    Picture {
+        protocol: &'a Protocol,
+        /// The gutter cells and their style, as a text paragraph would get them.
+        mark: (&'static str, Style),
+        target: &'a str,
+    },
+    Placeholder(Line<'a>),
+}
+
+/// Paragraph `i` as it will be drawn.
+///
+/// Only a paragraph that is one embed line and nothing else has media; everything
+/// else is text, exactly as before. An image becomes a picture when it was encoded
+/// and still fits the text width — the encoding follows the viewport, so a terminal
+/// narrowed since the last encode falls back to the placeholder rather than
+/// silently drawing nothing.
+fn chunk_for<'a>(read: &'a Read, i: usize, marks: &Marks, text_width: u16) -> Chunk<'a> {
+    let Some(media) = read.media.get(&i) else {
+        return Chunk::Text(paragraph_lines(read, i, marks));
+    };
+    let mark = gutter_mark(read, i, marks);
+    match media {
+        Media::Image { target, protocol: Some(p), .. } if p.size().width <= text_width => {
+            Chunk::Picture { protocol: p, mark, target }
+        }
+        Media::Image { target, note: Some(note), .. } => {
+            Chunk::Placeholder(placeholder_line(mark, format!("[image: {target} · {note}]")))
+        }
+        Media::Image { target, .. } => {
+            Chunk::Placeholder(placeholder_line(mark, format!("[image: {target}]")))
+        }
+        Media::Audio { target, .. } => {
+            Chunk::Placeholder(placeholder_line(mark, format!("♪ {target}")))
+        }
+        Media::Other { target } => {
+            let text = Embed { target: target.clone() }.placeholder();
+            Chunk::Placeholder(placeholder_line(mark, text))
+        }
+    }
+}
+
+/// The rows `chunk` takes inside `area`, wrapped exactly as it will be drawn.
+fn rows_of(chunk: &Chunk, area: Rect) -> u16 {
+    match chunk {
+        Chunk::Text(lines) => super::text_rows(lines, area),
+        Chunk::Picture { protocol, .. } => protocol.size().height,
+        Chunk::Placeholder(line) => super::text_rows(std::slice::from_ref(line), area),
+    }
+}
+
+/// The gutter of a media paragraph: the same amber bar, dim dot or two blanks
+/// [`paragraph_lines`] puts on a text paragraph's first line.
+fn gutter_mark(read: &Read, i: usize, marks: &Marks) -> (&'static str, Style) {
+    if i == read.cursor {
+        return ("▎ ", Style::new().fg(super::AMBER));
+    }
+    let harvested = read
+        .paragraphs
+        .get(i)
+        .is_some_and(|p| marks.children.iter().any(|c| c.start <= p.start && p.start < c.end));
+    if harvested {
+        ("• ", Style::new().dim())
+    } else {
+        ("  ", Style::new())
+    }
+}
+
+/// A dim one-row stand-in for media, behind the paragraph's gutter.
+fn placeholder_line(mark: (&'static str, Style), text: String) -> Line<'static> {
+    Line::from(vec![Span::styled(mark.0, mark.1), Span::styled(text, Style::new().dim())])
 }
 
 struct Marks<'a> {
     selection: Option<Offsets>,
     cursor_word: Option<Offsets>,
     children: &'a [Offsets],
-}
-
-/// Rows a line of `width_chars` takes when word-wrapped into `cols`, with one row of
-/// slack for the space word wrapping wastes.
-fn wrapped_rows(width_chars: usize, cols: u16) -> usize {
-    let cols = usize::from(cols.max(1));
-    if width_chars <= cols {
-        1
-    } else {
-        width_chars.div_ceil(cols) + 1
-    }
 }
 
 /// One `Line` per source line of paragraph `i`, styled per character offset.

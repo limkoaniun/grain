@@ -1,11 +1,9 @@
 //! Review screen: question, optional reference line, answer after reveal,
 //! grade row and a status line.
 
-use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::Frame;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::Image;
@@ -53,6 +51,9 @@ pub const DRILL_HINTS_AUDIO: &[(&str, &str)] = &[
 /// The finish line: nothing left to reveal, grade or undo.
 pub const DONE_HINTS: &[(&str, &str)] = &[("tab", "queue"), ("q", "quit")];
 
+/// The cloze marker `vault::article::cloze_text` writes.
+const BLANK: &str = "[...]";
+
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     if app.review.phase == Phase::DrillPrompt {
         let keys = Line::from(vec![
@@ -96,10 +97,19 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(1),
     ]));
 
+    // A cloze card shows its answer in the blank at the reveal, as SuperMemo does;
+    // the answer side is left alone, so the answer is also readable on its own.
+    let fill = if app.review.revealed {
+        first_answer_text(&cur.card.body.answer)
+    } else {
+        None
+    };
+
     // The reference lines are the question's last lines, so they hug the text instead
     // of floating at the bottom of the question area. `↳` (the parent) comes first,
     // then `↗` (where an import came from); either may stand alone.
-    let (mut question, q_images) = side_lines(&cur.card.body.question, &cur.media.question, app);
+    let (mut question, q_images) =
+        side_lines(&cur.card.body.question, &cur.media.question, app, fill);
     question.extend(reference_line(&cur.card.meta));
     if let Some(url) = cur.card.meta.url.as_deref() {
         question.push(super::url_line(url, cur.card.meta.imported, q_area.width));
@@ -107,7 +117,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     render_side(frame, q_area, question, q_images);
     if app.review.revealed {
         frame.render_widget(Line::from("─ ─ ─").dim(), gap_area);
-        let (answer, a_images) = side_lines(&cur.card.body.answer, &cur.media.answer, app);
+        let (answer, a_images) = side_lines(&cur.card.body.answer, &cur.media.answer, app, None);
         render_side(frame, a_area, answer, a_images);
         frame.render_widget(grade_row(), grade_area);
     }
@@ -142,7 +152,7 @@ fn render_side(frame: &mut Frame, area: Rect, lines: Vec<Line>, images: Vec<Pend
     let (lines, drawn) = loop {
         let lines = with_placeholders(&lines, &images, &given_up);
         let mut drawn: Vec<(Rect, &Protocol)> = Vec::with_capacity(images.len());
-        let mut y = area.y.saturating_add(text_rows(&lines, area));
+        let mut y = area.y.saturating_add(super::text_rows(&lines, area));
         let mut no_room = None;
         for (i, image) in images.iter().enumerate() {
             if given_up[i] {
@@ -163,7 +173,7 @@ fn render_side(frame: &mut Frame, area: Rect, lines: Vec<Line>, images: Vec<Pend
             None => break (lines, drawn),
         }
     };
-    frame.render_widget(wrapped(lines), area);
+    frame.render_widget(super::wrapped(lines), area);
     for (image_area, protocol) in drawn {
         frame.render_widget(Image::new(protocol), image_area);
     }
@@ -189,42 +199,21 @@ fn with_placeholders<'a>(
     lines
 }
 
-fn wrapped<'a>(lines: Vec<Line<'a>>) -> Paragraph<'a> {
-    Paragraph::new(lines).wrap(Wrap { trim: false })
-}
-
-/// The rows `lines` take inside `area`, wrapped exactly as they will be drawn.
-///
-/// `Paragraph::line_count` is behind ratatui's unstable `rendered-line-info`
-/// feature, so the widget answers instead of a second wrapping of our own: the same
-/// `Paragraph` is drawn into a scratch buffer the size of the side, and the last row
-/// carrying a character is the last row the text needs. Rows that stay blank are
-/// free for a picture.
-fn text_rows(lines: &[Line], area: Rect) -> u16 {
-    if area.width == 0 || area.height == 0 {
-        return 0;
-    }
-    let scratch_area = Rect::new(0, 0, area.width, area.height);
-    let mut scratch = Buffer::empty(scratch_area);
-    wrapped(lines.to_vec()).render(scratch_area, &mut scratch);
-    (0..area.height)
-        .rev()
-        .find(|&y| {
-            (0..area.width).any(|x| scratch.cell((x, y)).is_some_and(|c| c.symbol() != " "))
-        })
-        .map_or(0, |y| y + 1)
-}
-
 /// The lines of one side, and the images to draw under them.
 ///
 /// Embeds pair with `media` in order; a side whose media is not loaded yet (the
 /// answer before the reveal) falls back to the M0 placeholders. An image that was
 /// encoded leaves no line — it is drawn as a picture — but remembers the line index
 /// its placeholder takes if [`render_side`] finds no room for it.
+///
+/// `fill` is the cloze answer: the first `[...]` across the side's text lines is
+/// replaced by it, amber and bold. One line still becomes one line, so the image
+/// slots are unaffected.
 fn side_lines<'a>(
     segments: &'a [Segment],
     media: &'a [Media],
     app: &App,
+    mut fill: Option<&'a str>,
 ) -> (Vec<Line<'a>>, Vec<PendingImage<'a>>) {
     let mut lines: Vec<Line> = Vec::with_capacity(segments.len());
     let mut images = Vec::new();
@@ -232,7 +221,22 @@ fn side_lines<'a>(
     for segment in segments {
         let e = match segment {
             Segment::Text(t) => {
-                lines.push(Line::from(t.as_str()));
+                let blank =
+                    fill.and_then(|a| t.split_once(BLANK).map(|(before, after)| (a, before, after)));
+                lines.push(match blank {
+                    Some((answer, before, after)) => {
+                        fill = None;
+                        Line::from(vec![
+                            Span::raw(before),
+                            Span::styled(
+                                answer,
+                                Style::new().fg(super::AMBER).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(after),
+                        ])
+                    }
+                    None => Line::from(t.as_str()),
+                });
                 continue;
             }
             Segment::Embed(e) => e,
@@ -256,6 +260,15 @@ fn side_lines<'a>(
         }
     }
     (lines, images)
+}
+
+/// The text a cloze card fills its blank with: the answer side's first text line
+/// that is not blank, trimmed. `None` for a side with no text at all.
+fn first_answer_text(answer: &[Segment]) -> Option<&str> {
+    answer.iter().find_map(|s| match s {
+        Segment::Text(t) if !t.trim().is_empty() => Some(t.trim()),
+        _ => None,
+    })
 }
 
 /// `♪ pomelo.mp3`, dim, with what the sound is doing: amber ` · playing` while it

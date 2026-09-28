@@ -111,7 +111,11 @@ fn to_segments(lines: Vec<String>) -> Vec<Segment> {
 }
 
 /// Recognize a line that is exactly one embed: `![[target]]` or `![](target)`.
-fn parse_embed(line: &str) -> Option<Embed> {
+///
+/// Public because the read screen uses it to spot a picture paragraph: an
+/// article paragraph that is nothing but one embed line. The line is trimmed
+/// first, so an indented embed line still counts.
+pub fn parse_embed(line: &str) -> Option<Embed> {
     let l = line.trim();
     if let Some(inner) = l.strip_prefix("![[").and_then(|r| r.strip_suffix("]]")) {
         let target = inner.split('|').next().unwrap_or(inner).trim();
@@ -201,6 +205,16 @@ mod tests {
         assert_eq!(Embed { target: "x.m4a".into() }.placeholder(), "[embed: x.m4a]");
         assert_eq!(Embed { target: "x.ogg".into() }.placeholder(), "[audio: x.ogg]");
         assert_eq!(Embed { target: "x.webp".into() }.placeholder(), "[image: x.webp]");
+    }
+
+    #[test]
+    fn parse_embed_is_public_and_handles_both_forms() {
+        assert_eq!(parse_embed("![[a.png|alt]]"), Some(Embed { target: "a.png".into() }));
+        assert_eq!(parse_embed("![](media/b.jpg)"), Some(Embed { target: "media/b.jpg".into() }));
+        assert_eq!(parse_embed("text"), None);
+        // Pinned as observed, not as guessed: the line is trimmed first, so an
+        // indented embed line is still an embed.
+        assert_eq!(parse_embed("  ![[c.png]]"), Some(Embed { target: "c.png".into() }));
     }
 
     #[test]

@@ -168,17 +168,25 @@ pub fn load_side(
         .iter()
         .filter_map(|segment| match segment {
             Segment::Text(_) => None,
-            Segment::Embed(embed) => Some(match kind_of(&embed.target) {
-                MediaKind::Image => load_image(picker, index, &embed.target, image_box),
-                MediaKind::Audio => Media::Audio {
-                    target: embed.target.clone(),
-                    path: index.resolve(&embed.target),
-                    failed: false,
-                },
-                MediaKind::Other => Media::Other { target: embed.target.clone() },
-            }),
+            Segment::Embed(embed) => Some(load_embed(picker, index, &embed.target, image_box)),
         })
         .collect()
+}
+
+/// Resolve and prepare one embed target, by its kind.
+///
+/// The per-embed half of `load_side`, so a caller with a single target — the
+/// read screen's picture paragraphs — gets the same `Media` a card side would.
+pub fn load_embed(picker: &Picker, index: &MediaIndex, target: &str, image_box: Size) -> Media {
+    match kind_of(target) {
+        MediaKind::Image => load_image(picker, index, target, image_box),
+        MediaKind::Audio => Media::Audio {
+            target: target.to_string(),
+            path: index.resolve(target),
+            failed: false,
+        },
+        MediaKind::Other => Media::Other { target: target.to_string() },
+    }
 }
 
 /// Decode an image target and encode it for `image_box`.
@@ -503,6 +511,62 @@ mod tests {
                 other => panic!("expected an image, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn load_embed_matches_load_side_per_kind() {
+        let dir = temp_vault();
+        let index = MediaIndex::from_vault(dir.path()).unwrap();
+        let picker = test_picker();
+        let box_size = Size { width: 78, height: 8 };
+
+        match load_embed(&picker, &index, "buddhas-hand.jpg", box_size) {
+            Media::Image { target, protocol, note } => {
+                assert_eq!(target, "buddhas-hand.jpg");
+                assert_eq!(note, None);
+                let size = protocol.unwrap().size();
+                assert!(size.width >= 1 && size.width <= 78, "width {}", size.width);
+                assert!(size.height >= 1 && size.height <= 8, "height {}", size.height);
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+
+        match load_embed(&picker, &index, "nope.png", box_size) {
+            Media::Image { target, protocol, note } => {
+                assert_eq!(target, "nope.png");
+                assert!(protocol.is_none());
+                assert_eq!(note, Some("not found"));
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+
+        match load_embed(&picker, &index, "pomelo.mp3", box_size) {
+            Media::Audio { target, path, failed } => {
+                assert_eq!(target, "pomelo.mp3");
+                assert_eq!(path.as_deref(), Some("media/pomelo.mp3"));
+                assert!(!failed);
+            }
+            other => panic!("expected audio, got {other:?}"),
+        }
+
+        match load_embed(&picker, &index, "x.svg", box_size) {
+            Media::Other { target } => assert_eq!(target, "x.svg"),
+            other => panic!("expected other, got {other:?}"),
+        }
+
+        // `load_side` is that function per embed: text skipped, embed order kept.
+        let segments =
+            vec![embed("pomelo.png"), Segment::Text("x".to_string()), embed("pomelo.mp3")];
+        let media = load_side(&picker, &index, &segments, box_size);
+        assert_eq!(media.len(), 2, "{media:?}");
+        assert!(
+            matches!(&media[0], Media::Image { target, .. } if target == "pomelo.png"),
+            "{media:?}"
+        );
+        assert!(
+            matches!(&media[1], Media::Audio { target, .. } if target == "pomelo.mp3"),
+            "{media:?}"
+        );
     }
 
     #[test]
