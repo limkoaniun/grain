@@ -17,6 +17,7 @@ pub const HINTS: &[(&str, &str)] = &[
     ("enter", "open"),
     ("a", "add"),
     ("i", "import"),
+    ("s", "stats"),
     ("p", "prio"),
     ("tab", "learn"),
     ("q", "quit"),

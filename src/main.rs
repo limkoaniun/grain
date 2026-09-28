@@ -7,6 +7,7 @@ mod app;
 mod db;
 mod import;
 mod media;
+mod stats;
 mod sync;
 mod ui;
 mod vault;

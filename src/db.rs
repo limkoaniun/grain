@@ -108,6 +108,15 @@ pub struct PendingGrade {
     pub graded_at: String,
 }
 
+/// One journal row, for the stats screen. `synced` is ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GradeRow {
+    pub sm_id: i64,
+    pub grade: u8,
+    /// ISO 8601 UTC, as journaled.
+    pub graded_at: String,
+}
+
 /// The schedule a sync landed on a card: what goes into `items` alongside the journal update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Schedule {
@@ -311,6 +320,11 @@ impl Db {
         )
     }
 
+    /// Every row, done ones included; unordered by queue position. For the stats screen.
+    pub fn all_items(&self) -> Result<Vec<ItemRow>> {
+        self.select_items("ORDER BY sm_id ASC", &[])
+    }
+
     /// Items whose `source` is `target` (a path without `.md`), by position in the parent.
     pub fn children_of(&self, target: &str) -> Result<Vec<ItemRow>> {
         self.select_items("WHERE source = ?1 ORDER BY range_start ASC, sm_id ASC", &[&target])
@@ -443,6 +457,21 @@ impl Db {
                 sm_id: r.get(1)?,
                 grade: r.get::<_, i64>(2)?.clamp(0, 5) as u8,
                 graded_at: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Every journal row, insertion order (`id ASC`), synced or not. For the stats screen.
+    pub fn grades(&self) -> Result<Vec<GradeRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sm_id, grade, graded_at FROM journal ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(GradeRow {
+                sm_id: r.get(0)?,
+                grade: r.get::<_, i64>(1)?.clamp(0, 5) as u8,
+                graded_at: r.get(2)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -643,6 +672,20 @@ mod tests {
     }
 
     #[test]
+    fn all_items_includes_done_rows_that_queue_omits() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_item(&card(1, "a.md", 50, None)).unwrap();
+        let mut done = card(2, "b.md", 50, None);
+        done.done = Some(d("2026-09-01"));
+        db.upsert_item(&done).unwrap();
+        assert_eq!(db.queue().unwrap().len(), 1);
+        let all = db.all_items().unwrap();
+        assert_eq!(all.len(), 2);
+        let ids: Vec<i64> = all.iter().map(|i| i.sm_id).collect();
+        assert_eq!(ids, [1, 2], "ordered by sm_id ASC");
+    }
+
+    #[test]
     fn due_items_mixes_types_in_queue_order_and_skips_future() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_item(&card(1, "a.md", 10, Some("2026-09-25"))).unwrap();
@@ -712,6 +755,20 @@ mod tests {
         assert_eq!(pending[0].sm_id, 7);
         assert_eq!(pending[0].grade, 3);
         assert_eq!(pending[0].graded_at, "2026-09-20T10:00:00Z");
+    }
+
+    #[test]
+    fn grades_returns_every_journal_row_in_insertion_order() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db.insert_grade(1, 4, "2026-09-19T10:00:00Z").unwrap();
+        db.insert_grade(1, 2, "2026-09-20T10:00:00Z").unwrap();
+        db.apply_sync(first, 6, None).unwrap();
+        let grades = db.grades().unwrap();
+        assert_eq!(grades.len(), 2);
+        assert_eq!(grades[0].grade, 4);
+        assert_eq!(grades[0].graded_at, "2026-09-19T10:00:00Z");
+        assert_eq!(grades[1].grade, 2);
+        assert_eq!(grades[1].graded_at, "2026-09-20T10:00:00Z");
     }
 
     #[test]

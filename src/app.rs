@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Local, NaiveDate, SecondsFormat, Utc};
+use chrono::{Local, NaiveDate, SecondsFormat, Utc};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Size;
 use ratatui_image::picker::Picker;
@@ -32,6 +32,7 @@ use crate::vault::index::{
     write_read_pos, write_schedule, LoadedCard, NewItem, RefreshReport,
 };
 use crate::import::{fetch_title_body, html_to_markdown, Fetcher, UreqFetcher};
+use crate::stats::{self, local_date, Stats};
 
 /// How long `finish` waits for a reply already in flight.
 const QUIT_INFLIGHT_WAIT: Duration = Duration::from_secs(2);
@@ -43,6 +44,7 @@ pub enum Screen {
     Queue,
     Review,
     Read,
+    Stats,
 }
 
 /// Default `a_factor` when the article has none, and the clamp applied on read.
@@ -278,6 +280,10 @@ pub struct App {
     pub sync_log: Vec<String>,
     /// The article open on the read screen (M2).
     pub read: Option<Read>,
+    /// The snapshot behind the stats screen (M8), taken when it opens. `None` unless it is open.
+    pub stats: Option<Stats>,
+    /// Where `s` was pressed, so closing the stats screen goes back there. `Queue` or `Review`.
+    stats_from: Screen,
     prompt: Option<Prompt>,
     text_prompt: Option<TextPrompt>,
     sync: Option<Sync>,
@@ -342,6 +348,8 @@ impl App {
             refresh,
             sync_log: Vec::new(),
             read: None,
+            stats: None,
+            stats_from: Screen::Queue,
             prompt: None,
             text_prompt: None,
             sync: None,
@@ -460,10 +468,21 @@ impl App {
         }
     }
 
+    /// `stats · 8 items` for the status row on the stats screen: the whole collection,
+    /// done items included.
+    pub fn stats_context(&self) -> String {
+        let total = self.stats.as_ref().map_or(0, |s| s.total);
+        format!("stats · {total} items{}", self.unsynced_suffix())
+    }
+
     /// `(reached, len)` for the status-row progress bar during the main pass; `None` elsewhere.
     pub fn progress(&self) -> Option<(usize, usize)> {
         let len = self.review.due.len();
-        if len == 0 || self.review.phase != Phase::Main || self.screen == Screen::Queue {
+        if len == 0
+            || self.review.phase != Phase::Main
+            || self.screen == Screen::Queue
+            || self.screen == Screen::Stats
+        {
             return None;
         }
         Some(((self.review.pos + 1).min(len), len))
@@ -699,10 +718,17 @@ impl App {
                 self.audio.stop();
                 self.should_quit = true;
             }
-            KeyCode::Tab | KeyCode::BackTab => self.cycle_screen()?,
+            KeyCode::Tab | KeyCode::BackTab => {
+                if self.screen == Screen::Stats {
+                    self.close_stats()?;
+                } else {
+                    self.cycle_screen()?;
+                }
+            }
             _ => match self.screen {
                 Screen::Queue => self.handle_queue_key(key)?,
                 Screen::Review => self.handle_review_key(key)?,
+                Screen::Stats => self.handle_stats_key(key)?,
                 Screen::Read => {}
             },
         }
@@ -904,6 +930,7 @@ impl App {
             }
             KeyCode::Char('a') => self.open_text_prompt(TextKind::CardQuestion),
             KeyCode::Char('i') => self.open_text_prompt(TextKind::Import),
+            KeyCode::Char('s') => self.open_stats()?,
             _ => {}
         }
         Ok(())
@@ -1384,6 +1411,7 @@ impl App {
             }
             KeyCode::Char('u') => self.undo()?,
             KeyCode::Char('r') => self.replay(),
+            KeyCode::Char('s') => self.open_stats()?,
             _ => {}
         }
         Ok(())
@@ -1451,8 +1479,46 @@ impl App {
                 self.audio.stop();
                 self.screen = Screen::Queue;
             }
+            // Unreachable through `handle_key_with`, which closes the stats screen itself.
+            Screen::Stats => self.close_stats()?,
         }
         Ok(())
+    }
+
+    // ---- stats screen (M8) ----
+
+    /// `s`: take one snapshot of the collection and show it. Nothing is written; the
+    /// numbers are as of this moment and do not move while the screen is up.
+    fn open_stats(&mut self) -> Result<()> {
+        self.audio.stop();
+        let items = self.db.all_items()?;
+        let grades = self.db.grades()?;
+        self.stats = Some(stats::compute(&items, &grades, self.today, self.review.drill.len())?);
+        self.stats_from = self.screen;
+        self.screen = Screen::Stats;
+        Ok(())
+    }
+
+    /// Drop the snapshot and go back where `s` was pressed: the session reopens whatever
+    /// it is on, anything else lands on the table.
+    fn close_stats(&mut self) -> Result<()> {
+        self.stats = None;
+        match self.stats_from {
+            Screen::Review => self.load_current(),
+            _ => {
+                self.screen = Screen::Queue;
+                Ok(())
+            }
+        }
+    }
+
+    /// `s` and `esc` close the stats screen; `tab` and `q` are handled before the screen
+    /// sees the key. Every other key is ignored.
+    fn handle_stats_key(&mut self, key: KeyCode) -> Result<()> {
+        match key {
+            KeyCode::Char('s') | KeyCode::Esc => self.close_stats(),
+            _ => Ok(()),
+        }
     }
 
     /// Jump the session to `sm_id`, inserting it at the current position if it is not due yet.
@@ -1631,13 +1697,6 @@ impl App {
         self.set_status(Some(format!("undid grade {}", last.grade)));
         Ok(())
     }
-}
-
-/// The local calendar date of an ISO 8601 UTC `graded_at`: the `review_date` the API gets.
-fn local_date(graded_at: &str) -> Result<NaiveDate> {
-    let utc = DateTime::parse_from_rfc3339(graded_at)
-        .with_context(|| format!("graded_at `{graded_at}` is not RFC 3339"))?;
-    Ok(utc.with_timezone(&Local).date_naive())
 }
 
 /// Whether `i` should fetch `input` rather than read it off disk.
@@ -3293,6 +3352,181 @@ mod tests {
         walk_to_prompt_with(&mut app, ['4', '4', '4', '4']);
         assert_eq!(app.review.phase, Phase::Main, "no failure, no drill");
         assert_eq!(app.progress(), Some((6, 6)), "a finished pass reads full");
+    }
+
+    // ---- stats screen (M8) ----
+
+    #[test]
+    fn s_opens_stats_from_the_queue_and_esc_returns() {
+        let (_d, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        press(&mut app, 'j');
+        press(&mut app, 'j');
+        assert_eq!(app.queue_sel, 2);
+
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Stats);
+        assert_eq!(app.stats.as_ref().unwrap().total, 8, "every item, done ones included");
+
+        app.handle_key(KeyCode::Esc).unwrap();
+        assert_eq!(app.screen, Screen::Queue);
+        assert!(app.stats.is_none(), "the snapshot is dropped when the screen closes");
+        assert_eq!(app.queue_sel, 2, "the table selection survives the visit");
+    }
+
+    #[test]
+    fn s_from_the_session_returns_to_the_same_card() {
+        let (_d, mut app) = fixture_app();
+        let sm_id = app.review.current.as_ref().unwrap().item.sm_id;
+        let pos = app.review.pos;
+
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Stats);
+
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.review.current.as_ref().unwrap().item.sm_id, sm_id);
+        assert_eq!(app.review.pos, pos);
+
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Stats);
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.screen, Screen::Review, "tab closes the stats screen too");
+        assert_eq!(app.review.current.as_ref().unwrap().item.sm_id, sm_id);
+    }
+
+    #[test]
+    fn s_is_inert_on_the_read_screen_and_in_prompts() {
+        let (_d, mut app) = fixture_app();
+        open_article(&mut app, "citrus-vocab.md");
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Read, "s is not a read-screen key");
+        assert!(app.stats.is_none());
+
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.screen, Screen::Queue);
+        press(&mut app, 'p');
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Queue);
+        assert!(app.prompt_text().is_some(), "the priority prompt swallows s");
+        assert!(app.stats.is_none());
+        app.handle_key(KeyCode::Esc).unwrap();
+
+        press(&mut app, 'a');
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Queue);
+        assert!(app.text_prompt_stage().is_some(), "s is typed into the text prompt");
+        assert!(app.stats.is_none());
+        app.handle_key(KeyCode::Esc).unwrap();
+    }
+
+    #[test]
+    fn s_is_inert_in_the_drill_prompt() {
+        let (_d, mut app) = fixture_app();
+        walk_to_prompt(&mut app);
+        assert_eq!(app.review.phase, Phase::DrillPrompt);
+
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.review.phase, Phase::DrillPrompt);
+        assert!(app.stats.is_none());
+
+        press(&mut app, 'y');
+        assert_eq!(app.review.phase, Phase::Drilling);
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.review.phase, Phase::Drilling);
+        assert!(app.stats.is_none());
+    }
+
+    #[test]
+    fn stats_context_counts_every_item() {
+        let (_d, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        press(&mut app, 's');
+        assert_eq!(app.stats_context(), "stats · 8 items");
+    }
+
+    #[test]
+    fn stats_snapshot_sees_this_sessions_grades() {
+        let (_d, mut app) = fixture_app();
+        grade_current(&mut app, '2');
+        // Grading the first session card (yuzu, prio 12) lands on citrus-vocab, an
+        // article, where `s` is inert; the table is the way to the stats screen.
+        app.handle_key(KeyCode::Tab).unwrap();
+        press(&mut app, 's');
+
+        let stats = app.stats.as_ref().unwrap();
+        assert_eq!(stats.grades_total, 1);
+        assert_eq!(stats.lapses_total, 1, "grade 2 is a lapse");
+        // `grade` stamps the row with the wall clock, not the session's fixed `today`, so
+        // the row lands on the real local date and only counts as today's when the suite
+        // happens to run on 2026-09-20.
+        assert_eq!(stats.graded_by_day[&review_date()], 1);
+        let is_today = usize::from(review_date() == today());
+        assert_eq!(stats.grades_today, is_today);
+        assert_eq!(stats.lapses_today, is_today);
+        // yuzu has no `interval`, so it only counts as memorized once it has a journal
+        // row: the four cards with an interval plus yuzu.
+        assert_eq!(stats.memorized, 5);
+        assert_eq!(stats.pending, 3);
+    }
+
+    #[test]
+    fn drill_count_shows_in_outstanding() {
+        let (_d, mut app) = fixture_app();
+        grade_current(&mut app, '2');
+        app.handle_key(KeyCode::Enter).unwrap(); // end citrus-vocab, on to kumquat
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.review.phase, Phase::Main);
+        assert_eq!(app.review.drill.len(), 1, "yuzu failed and waits for the drill");
+
+        press(&mut app, 's');
+        let stats = app.stats.as_ref().unwrap();
+        assert_eq!(stats.drill, 1);
+        let outstanding = stats.fields()[4].1.clone();
+        assert!(outstanding.ends_with("+1"), "{outstanding}");
+    }
+
+    #[test]
+    fn back_tab_closes_stats_and_q_still_quits() {
+        let (_d, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        press(&mut app, 's');
+        app.handle_key(KeyCode::BackTab).unwrap();
+        assert_eq!(app.screen, Screen::Queue);
+        assert!(app.stats.is_none());
+
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Stats);
+        press(&mut app, 'q');
+        assert!(app.should_quit, "q quits from the stats screen like everywhere else");
+    }
+
+    #[test]
+    fn s_opens_stats_from_the_finish_line() {
+        let (_d, mut app) = fixture_app();
+        walk_to_prompt_with(&mut app, ['4', '4', '4', '4']);
+        assert_eq!(app.screen, Screen::Review);
+        assert!(app.review.current.is_none(), "the finish line, no card");
+        assert_eq!(app.review.phase, Phase::Main);
+
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Stats);
+        assert_eq!(app.stats.as_ref().unwrap().total, 8);
+
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Review);
+        assert!(app.review.current.is_none(), "back to the finish line");
+    }
+
+    #[test]
+    fn progress_bar_is_hidden_on_stats() {
+        let (_d, mut app) = fixture_app();
+        assert!(app.progress().is_some());
+        press(&mut app, 's');
+        assert_eq!(app.screen, Screen::Stats);
+        assert!(app.progress().is_none(), "no bar over the stats screen");
     }
 
     #[test]

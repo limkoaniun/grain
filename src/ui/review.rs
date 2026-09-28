@@ -18,6 +18,7 @@ pub const HINTS: &[(&str, &str)] = &[
     ("0-5", "grade"),
     ("u", "undo"),
     ("tab", "queue"),
+    ("s", "stats"),
     ("q", "quit"),
 ];
 
@@ -28,6 +29,7 @@ pub const HINTS_AUDIO: &[(&str, &str)] = &[
     ("u", "undo"),
     ("r", "replay"),
     ("tab", "queue"),
+    ("s", "stats"),
     ("q", "quit"),
 ];
 
@@ -49,7 +51,7 @@ pub const DRILL_HINTS_AUDIO: &[(&str, &str)] = &[
 ];
 
 /// The finish line: nothing left to reveal, grade or undo.
-pub const DONE_HINTS: &[(&str, &str)] = &[("tab", "queue"), ("q", "quit")];
+pub const DONE_HINTS: &[(&str, &str)] = &[("tab", "queue"), ("s", "stats"), ("q", "quit")];
 
 /// The cloze marker `vault::article::cloze_text` writes.
 const BLANK: &str = "[...]";
