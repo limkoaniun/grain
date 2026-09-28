@@ -78,12 +78,16 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 /// The review hints follow the session: the drill prompt, the drill, the finish
-/// line, or a card in the main pass.
+/// line, or a card in the main pass. A card with a sound on either side gains
+/// `r replay`; `r` works in the drill too, so the drill row gains it as well.
 fn review_hints(app: &App) -> &'static [(&'static str, &'static str)] {
+    let audio = app.card_has_audio();
     match (app.review.phase, app.review.current.is_some()) {
         (Phase::DrillPrompt, _) => review::DRILL_PROMPT_HINTS,
+        (Phase::Drilling, _) if audio => review::DRILL_HINTS_AUDIO,
         (Phase::Drilling, _) => review::DRILL_HINTS,
         (Phase::Main, false) => review::DONE_HINTS,
+        (Phase::Main, true) if audio => review::HINTS_AUDIO,
         (Phase::Main, true) => review::HINTS,
     }
 }
@@ -212,24 +216,89 @@ mod tests {
 
     use super::*;
     use crate::app::App;
+    use crate::media::{test_picker, AudioLog, NullAudio};
     use chrono::NaiveDate;
     use crossterm::event::KeyCode;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::Terminal;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
-    fn fixture_app() -> (tempfile::TempDir, App) {
-        let dir = tempfile::tempdir().unwrap();
+    /// The fixture vault's top-level markdown files, copied into `dest`.
+    fn copy_fixture_notes(dest: &Path) {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/vault");
         for entry in std::fs::read_dir(&src).unwrap() {
             let entry = entry.unwrap();
             if entry.file_type().unwrap().is_file() {
-                std::fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
+                std::fs::copy(entry.path(), dest.join(entry.file_name())).unwrap();
             }
         }
+    }
+
+    /// The fixture vault's `media/` folder, so `![[pomelo.png]]` resolves to a real
+    /// file. Without it every embed would render as `· not found`.
+    fn copy_fixture_media(dest: &Path) {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/vault/media");
+        std::fs::create_dir_all(dest.join("media")).unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), dest.join("media").join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    fn fixture_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        copy_fixture_notes(dir.path());
+        copy_fixture_media(dir.path());
         let today = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         let app = App::open(dir.path(), today).unwrap();
         (dir, app)
+    }
+
+    /// The fixture vault with the halfblocks picker, an 80x24 viewport and an audio
+    /// backend that opens no device: what a card's media needs to be drawn at all.
+    /// `extra` files are written over the vault before it is indexed.
+    fn media_app(extra: &[(&str, &str)]) -> (tempfile::TempDir, App, Arc<Mutex<AudioLog>>) {
+        let dir = tempfile::tempdir().unwrap();
+        copy_fixture_notes(dir.path());
+        copy_fixture_media(dir.path());
+        open_media_app(dir, extra)
+    }
+
+    /// `media/` and `extra`, nothing else: one due card, so the app opens on it.
+    fn solo_media_app(extra: &[(&str, &str)]) -> (tempfile::TempDir, App, Arc<Mutex<AudioLog>>) {
+        let dir = tempfile::tempdir().unwrap();
+        copy_fixture_media(dir.path());
+        open_media_app(dir, extra)
+    }
+
+    fn open_media_app(
+        dir: tempfile::TempDir,
+        extra: &[(&str, &str)],
+    ) -> (tempfile::TempDir, App, Arc<Mutex<AudioLog>>) {
+        for (name, body) in extra {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        let today = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let mut app = App::open(dir.path(), today).unwrap();
+        app.set_picker(test_picker());
+        let (audio, log) = NullAudio::new();
+        app.set_audio(Box::new(audio));
+        app.set_viewport(80, 24);
+        (dir, app, log)
+    }
+
+    /// Open `path` from the table, which also inserts it into the session.
+    fn open_card(app: &mut App, path: &str) {
+        if app.screen != Screen::Queue {
+            app.handle_key(KeyCode::Tab).unwrap();
+        }
+        let idx = app.items.iter().position(|i| i.path == path).unwrap();
+        app.queue_sel = idx;
+        app.handle_key(KeyCode::Enter).unwrap();
     }
 
     /// A one-file vault written before `App::open`, so the frontmatter is indexed.
@@ -284,9 +353,11 @@ mod tests {
 
     /// Render into an 80x24 test terminal and return the rows as trimmed strings.
     fn rows(app: &App) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|f| render(f, app)).unwrap();
-        let buf = terminal.backend().buffer();
+        rows_of(&buffer_at(app, 80, 24))
+    }
+
+    /// The rows of a rendered buffer as trimmed strings.
+    fn rows_of(buf: &Buffer) -> Vec<String> {
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
@@ -296,6 +367,18 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// Cells a halfblocks image wrote on rows `y0..=y1`: its glyph is `▀`, and every
+    /// cell it touches carries a background colour. Text never sets one.
+    fn image_cells(buf: &Buffer, y0: u16, y1: u16) -> usize {
+        (y0..=y1.min(buf.area.height.saturating_sub(1)))
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                buf.cell((x, y))
+                    .is_some_and(|c| c.symbol() == "▀" || c.bg != Color::Reset)
+            })
+            .count()
     }
 
     /// Render into a `w`x`h` test terminal and return the whole screen as one string.
@@ -314,8 +397,13 @@ mod tests {
     }
 
     /// Render into an 80x24 test terminal and return the raw buffer, for style assertions.
-    fn buffer(app: &App) -> ratatui::buffer::Buffer {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    fn buffer(app: &App) -> Buffer {
+        buffer_at(app, 80, 24)
+    }
+
+    /// The same at an arbitrary size.
+    fn buffer_at(app: &App, w: u16, h: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| render(f, app)).unwrap();
         terminal.backend().buffer().clone()
     }
@@ -538,9 +626,151 @@ mod tests {
         app.handle_key(KeyCode::Char(' ')).unwrap();
         let all = rows(&app).join("\n");
         assert!(all.contains("pomelo /ˈpɒmɪloʊ/"), "{all}");
-        assert!(all.contains("[audio: pomelo.mp3]"), "{all}");
+        assert!(all.contains("♪ pomelo.mp3"), "{all}");
         assert!(!all.contains("A:"), "markers never shown");
         assert!(all.contains("0 null   1 bad   2 fail   │   3 pass   4 good   5 bright"), "{all}");
+    }
+
+    /// A card whose question image is missing and whose answer sound is missing.
+    const MISSING_MEDIA: (&str, &str) = (
+        "missing.md",
+        "---\ntype: card\nsm_id: 300\nprio: 1\n---\nQ: gone?\n![[nope.png]]\n\nA: yes\n![[ghost.mp3]]\n",
+    );
+
+    /// A card with two images on the question side: at 80x24 there is room for the
+    /// first under the text and none for the second.
+    const TWO_IMAGES: (&str, &str) = (
+        "two-images.md",
+        "---\ntype: card\nsm_id: 302\nprio: 1\n---\nQ: two\n![[pomelo.png]]\n![[buddhas-hand.jpg]]\n\nA: ok\n",
+    );
+
+    /// A card with a sound and no image, due today and first in the queue.
+    const SOLO_AUDIO: (&str, &str) = (
+        "solo.md",
+        "---\ntype: card\nsm_id: 301\nprio: 1\n---\nQ: hear?\n![[pomelo.mp3]]\n\nA: a pomelo\n",
+    );
+
+    #[test]
+    fn review_renders_the_question_image_under_the_text() {
+        let (_d, mut app, _log) = media_app(&[]);
+        open_card(&mut app, "pomelo.md");
+        let r = rows(&app);
+        let all = r.join("\n");
+        assert!(all.contains("Large citrus fruit with a thick rind"), "{all}");
+        assert!(all.contains("↳ citrus-vocab.md"), "the reference line stays: {all}");
+        assert!(
+            !all.contains("[image: pomelo.png"),
+            "the image is drawn, not named: {all}"
+        );
+
+        // The question area is rows 2..=11; the picture sits under its two text lines.
+        let buf = buffer(&app);
+        assert!(image_cells(&buf, 2, 11) > 0, "no image cells in the question area: {r:?}");
+        assert_eq!(image_cells(&buf, 0, 3), 0, "the text rows are untouched: {r:?}");
+    }
+
+    /// The placeholder of a second image is itself a line, so it moves the first
+    /// image down. Settling the two is what keeps the picture off the text.
+    #[test]
+    fn a_second_image_that_does_not_fit_keeps_its_placeholder() {
+        let (_d, app, _log) = solo_media_app(&[TWO_IMAGES]);
+        let r = rows(&app);
+        let buf = buffer(&app);
+
+        let y = r
+            .iter()
+            .position(|l| l.contains("[image: buddhas-hand.jpg]"))
+            .unwrap_or_else(|| panic!("the second image keeps its placeholder: {r:?}"))
+            as u16;
+        assert_eq!(r[y as usize].trim(), "[image: buddhas-hand.jpg]", "in full: {r:?}");
+        assert_eq!(
+            image_cells(&buf, y, y),
+            0,
+            "no picture sits on the placeholder's row: {r:?}"
+        );
+        assert!(
+            image_cells(&buf, y + 1, 21) > 0,
+            "the first image is still drawn, under the text: {r:?}"
+        );
+        assert!(
+            !r.iter().any(|l| l.contains("[image: pomelo.png")),
+            "the first image is a picture, not a line: {r:?}"
+        );
+    }
+
+    #[test]
+    fn review_shows_audio_line_after_reveal() {
+        let (_d, mut app, log) = media_app(&[]);
+        open_card(&mut app, "pomelo.md");
+        let all = rows(&app).join("\n");
+        assert!(!all.contains('♪'), "the answer's sound is hidden before the reveal: {all}");
+
+        app.handle_key(KeyCode::Char(' ')).unwrap();
+        let all = rows(&app).join("\n");
+        assert!(all.contains("♪ pomelo.mp3"), "{all}");
+        assert!(!all.contains("· playing"), "nothing plays until the log says so: {all}");
+
+        log.lock().unwrap().playing = true;
+        let r = rows(&app);
+        let all = r.join("\n");
+        assert!(all.contains("♪ pomelo.mp3 · playing"), "{all}");
+        let y = r.iter().position(|l| l.contains("♪ pomelo.mp3")).unwrap() as u16;
+        let col = r[y as usize].find("playing").unwrap();
+        let x = r[y as usize][..col].chars().count() as u16;
+        let buf = buffer(&app);
+        assert_eq!(buf[(x, y)].style().fg, Some(AMBER), "`playing` is amber");
+    }
+
+    #[test]
+    fn review_placeholder_when_no_room() {
+        let (_d, mut app, _log) = media_app(&[]);
+        open_card(&mut app, "pomelo.md");
+        app.set_viewport(80, 10);
+
+        let buf = buffer_at(&app, 80, 10);
+        let r = rows_of(&buf);
+        assert!(
+            r.iter().any(|l| l.contains("[image: pomelo.png]")),
+            "no room for the picture, so the placeholder comes back: {r:?}"
+        );
+        assert_eq!(image_cells(&buf, 0, 9), 0, "nothing is drawn: {r:?}");
+    }
+
+    #[test]
+    fn review_hints_show_replay_only_with_audio() {
+        let (_d, mut app, _log) = media_app(&[]);
+        open_card(&mut app, "pomelo.md");
+        assert_eq!(
+            rows(&app)[23],
+            "space reveal · 0-5 grade · u undo · r replay · tab queue · q quit"
+        );
+
+        // yuzu has no embeds at all.
+        open_card(&mut app, "yuzu.md");
+        assert_eq!(rows(&app)[23], "space reveal · 0-5 grade · u undo · tab queue · q quit");
+    }
+
+    #[test]
+    fn drill_hints_show_replay_with_audio() {
+        let (_d, mut app, _log) = solo_media_app(&[SOLO_AUDIO]);
+        // One due card: fail it, take the drill offer, and the drilled card still has
+        // its sound — but no undo, so `r` takes undo's place.
+        app.handle_key(KeyCode::Char(' ')).unwrap();
+        app.handle_key(KeyCode::Char('2')).unwrap();
+        app.handle_key(KeyCode::Char('y')).unwrap();
+        assert_eq!(app.review.phase, Phase::Drilling);
+        assert_eq!(rows(&app)[23], "space reveal · 0-5 grade · r replay · tab queue · q quit");
+    }
+
+    #[test]
+    fn review_missing_media_notes() {
+        let (_d, mut app, _log) = solo_media_app(&[MISSING_MEDIA]);
+        let all = rows(&app).join("\n");
+        assert!(all.contains("[image: nope.png · not found]"), "{all}");
+
+        app.handle_key(KeyCode::Char(' ')).unwrap();
+        let all = rows(&app).join("\n");
+        assert!(all.contains("♪ ghost.mp3 · not found"), "{all}");
     }
 
     #[test]
@@ -1025,5 +1255,16 @@ mod tests {
             "---\ntype: article\nurl: https://example.com/\nimported: 2026-09-20\n---\n",
         );
         draw_tiny(&empty_app);
+
+        // M6: a card carrying an encoded image and a sound, before and after the reveal.
+        let (_media_dir, mut media, _log) = media_app(&[]);
+        open_card(&mut media, "pomelo.md");
+        draw_tiny(&media);
+        for (w, h) in [(20u16, 3u16), (40, 2), (3, 30)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| render(f, &media)).unwrap();
+        }
+        media.handle_key(KeyCode::Char(' ')).unwrap();
+        draw_tiny(&media);
     }
 }

@@ -47,6 +47,34 @@ pub fn scan_vault(root: &Path) -> Result<Vec<ScannedFile>> {
     Ok(files)
 }
 
+/// Every non-markdown file under `root`, vault-relative and sorted, skipping
+/// dot-directories. These are the embed candidates: images, sounds, anything else.
+pub fn scan_media(root: &Path) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    let walker = WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !is_hidden(e.file_name()));
+    for entry in walker {
+        let entry = entry.with_context(|| format!("scanning {}", root.display()))?;
+        if !entry.file_type().is_file() || entry.path().extension().is_some_and(|x| x == "md") {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(root)
+            .with_context(|| format!("relativizing {}", entry.path().display()))?;
+        paths.push(
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/"),
+        );
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 /// Modification time of a file, in whole seconds since the Unix epoch.
 pub fn mtime_of(path: &Path) -> Result<i64> {
     let modified = std::fs::metadata(path)
@@ -88,5 +116,24 @@ mod tests {
         paths.sort();
         assert_eq!(paths, ["a.md", "sub/deeper/b.md"]);
         assert!(files.iter().all(|f| f.mtime > 0));
+    }
+
+    #[test]
+    fn scan_media_lists_non_md_files_and_skips_dot_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.md"), "x").unwrap();
+        fs::create_dir_all(root.join("media")).unwrap();
+        fs::write(root.join("media/p.png"), "x").unwrap();
+        fs::write(root.join("media/s.mp3"), "x").unwrap();
+        fs::create_dir_all(root.join("sub/deep")).unwrap();
+        fs::write(root.join("sub/deep/x.jpg"), "x").unwrap();
+        fs::create_dir_all(root.join(".grain")).unwrap();
+        fs::write(root.join(".grain/y.png"), "x").unwrap();
+        fs::create_dir_all(root.join(".obsidian")).unwrap();
+        fs::write(root.join(".obsidian/z.png"), "x").unwrap();
+
+        let paths = scan_media(root).unwrap();
+        assert_eq!(paths, ["media/p.png", "media/s.mp3", "sub/deep/x.jpg"]);
     }
 }
