@@ -5,6 +5,8 @@
 
 use anyhow::{bail, Result};
 
+use crate::media::{kind_of, MediaKind};
+
 /// One embedded file reference (`![[x]]` or `![](x)`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Embed {
@@ -12,17 +14,15 @@ pub struct Embed {
 }
 
 impl Embed {
-    /// Placeholder line shown in place of the media in M0.
+    /// Placeholder line shown in place of the media.
+    ///
+    /// The label follows what grain can actually handle, so a target grain
+    /// cannot decode or play reads as a plain `[embed: …]`.
     pub fn placeholder(&self) -> String {
-        let ext = self
-            .target
-            .rsplit_once('.')
-            .map(|(_, e)| e.to_ascii_lowercase())
-            .unwrap_or_default();
-        let kind = match ext.as_str() {
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" => "image",
-            "mp3" | "wav" | "ogg" | "m4a" | "flac" | "opus" => "audio",
-            _ => "embed",
+        let kind = match kind_of(&self.target) {
+            MediaKind::Image => "image",
+            MediaKind::Audio => "audio",
+            MediaKind::Other => "embed",
         };
         format!("[{kind}: {}]", self.target)
     }
@@ -191,6 +191,16 @@ mod tests {
         assert_eq!(Embed { target: "pomelo.png".into() }.placeholder(), "[image: pomelo.png]");
         assert_eq!(Embed { target: "pomelo.mp3".into() }.placeholder(), "[audio: pomelo.mp3]");
         assert_eq!(Embed { target: "note".into() }.placeholder(), "[embed: note]");
+    }
+
+    #[test]
+    fn placeholder_kinds_match_decoders() {
+        // svg is not decodable by the image crate, and m4a/opus are not among the
+        // enabled rodio codecs, so neither gets an image or audio label.
+        assert_eq!(Embed { target: "x.svg".into() }.placeholder(), "[embed: x.svg]");
+        assert_eq!(Embed { target: "x.m4a".into() }.placeholder(), "[embed: x.m4a]");
+        assert_eq!(Embed { target: "x.ogg".into() }.placeholder(), "[audio: x.ogg]");
+        assert_eq!(Embed { target: "x.webp".into() }.placeholder(), "[image: x.webp]");
     }
 
     #[test]

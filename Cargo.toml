@@ -10,7 +10,10 @@ description = "Terminal spaced-repetition and incremental-reading app over a mar
 anyhow = "1"
 chrono = "0.4"
 crossterm = "0.29"
+image = "0.25"
 ratatui = "0.30"
+ratatui-image = { version = "11.1.0", default-features = false, features = ["image-defaults", "crossterm"] }
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "mp3", "wav", "vorbis", "flac"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

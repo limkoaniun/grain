@@ -6,6 +6,7 @@
 mod app;
 mod db;
 mod import;
+mod media;
 mod sync;
 mod ui;
 mod vault;
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
+use ratatui_image::picker::Picker;
 
 use crate::app::App;
 use crate::sync::api::{Scheduler, UreqScheduler, API_KEY_ENV};
@@ -112,6 +114,11 @@ fn event_to_action(ev: Event) -> Option<Action> {
 
 fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     crossterm::execute!(std::io::stdout(), EnableBracketedPaste).context("bracketed paste")?;
+    // Queries stdio for the terminal's image protocol; must run after the alternate
+    // screen is entered (ratatui::run already did that) and before any event read
+    // (the loop below has not started). This is the only call site for this method.
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    app.set_picker(picker);
     let result = run_events(terminal, app);
     crossterm::execute!(std::io::stdout(), DisableBracketedPaste).context("bracketed paste")?;
     result
@@ -119,6 +126,8 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 
 fn run_events(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     while !app.should_quit {
+        let size = terminal.size().context("terminal size")?;
+        app.set_viewport(size.width, size.height);
         terminal.draw(|frame| ui::render(frame, app))?;
         if event::poll(TICK)? {
             match event_to_action(event::read()?) {

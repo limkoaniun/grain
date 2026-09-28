@@ -8,8 +8,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDate, SecondsFormat, Utc};
 use crossterm::event::{KeyCode, KeyModifiers};
+use ratatui::layout::Size;
+use ratatui_image::picker::Picker;
 
 use crate::db::{Db, ItemRow, Schedule};
+use crate::media::{
+    kind_of, load_side, Audio, Media, MediaIndex, MediaKind, RodioAudio, SideMedia, IMAGE_ROWS,
+};
+use crate::vault::card::Segment;
 use crate::vault::article::{self, Paragraph, Span};
 use crate::vault::frontmatter::Document;
 use crate::sync::api::{Identity, Scheduler, API_KEY_ENV};
@@ -181,11 +187,20 @@ pub enum TextStage {
     Final,
 }
 
-/// The card on screen in review.
-#[derive(Debug, Clone)]
+/// The card on screen in review, with its media already resolved: the question
+/// side from the moment the card is shown, the answer side from the reveal.
+#[derive(Debug)]
 pub struct CurrentCard {
     pub item: ItemRow,
     pub card: LoadedCard,
+    pub media: SideMedia,
+}
+
+/// Which half of a card a sound or an image belongs to.
+#[derive(Debug, Clone, Copy)]
+enum Side {
+    Question,
+    Answer,
 }
 
 /// One grade that can be undone this session.
@@ -269,6 +284,19 @@ pub struct App {
     fetcher: Box<dyn Fetcher>,
     /// A URL `i` accepted and has not fetched yet.
     pending_import: Option<PendingImport>,
+    /// How images are encoded for this terminal. `main` replaces it with the queried
+    /// picker; the default encodes halfblocks and asks the terminal nothing, so tests
+    /// and `--auth-check` never touch stdio.
+    picker: Picker,
+    /// Where sounds go. The default opens no device until a card actually plays one.
+    audio: Box<dyn Audio>,
+    /// Terminal size as of the last frame, `(cols, rows)`; `(0, 0)` until `main` sets it.
+    /// Only the width matters: it fixes the box an image is encoded into.
+    viewport: (u16, u16),
+    /// Every media file in the vault, for resolving `![[...]]` targets.
+    media_index: MediaIndex,
+    /// The target of the sound started last, so the review screen can mark that line.
+    last_played_target: Option<String>,
 }
 
 /// A URL waiting for the frame that says `fetching …`.
@@ -289,6 +317,8 @@ impl App {
     pub fn open(root: &Path, today: NaiveDate) -> Result<Self> {
         let db = Db::open(&root.join(".grain").join("grain.db"))?;
         let refresh = refresh(root, &db).context("refreshing index")?;
+        // After the refresh: a file the index just created is a file an embed may name.
+        let media_index = MediaIndex::from_vault(root).context("indexing vault media")?;
         let items = db.queue()?;
         let due = db.due_items(today)?.into_iter().map(|i| i.sm_id).collect();
         let mut app = App {
@@ -314,6 +344,11 @@ impl App {
             today,
             fetcher: Box::new(UreqFetcher::new()),
             pending_import: None,
+            picker: Picker::halfblocks(),
+            audio: Box::new(RodioAudio::new()),
+            viewport: (0, 0),
+            media_index,
+            last_played_target: None,
         };
         app.load_current()?;
         Ok(app)
@@ -481,6 +516,140 @@ impl App {
         self.fetcher = f;
     }
 
+    /// Swap the picker images are encoded with: `main` queries the terminal once and
+    /// hands the answer over here. Cards already on screen keep the encoding they have
+    /// until the next load or viewport change.
+    pub fn set_picker(&mut self, picker: Picker) {
+        self.picker = picker;
+    }
+
+    /// Swap the sound backend (tests).
+    #[cfg(test)]
+    pub fn set_audio(&mut self, audio: Box<dyn Audio>) {
+        self.audio = audio;
+    }
+
+    /// Remember the terminal size. A changed width means a changed image box, so the
+    /// card on screen is encoded again — the sides already loaded, and nothing else:
+    /// re-encoding never replays a sound.
+    pub fn set_viewport(&mut self, cols: u16, rows: u16) {
+        let resized = self.viewport.0 != cols;
+        self.viewport = (cols, rows);
+        if !resized {
+            return;
+        }
+        let image_box = self.image_box();
+        let revealed = self.review.revealed;
+        if let Some(cur) = self.review.current.as_mut() {
+            cur.media.question =
+                load_side(&self.picker, &self.media_index, &cur.card.body.question, image_box);
+            if revealed {
+                cur.media.answer =
+                    load_side(&self.picker, &self.media_index, &cur.card.body.answer, image_box);
+            }
+        }
+    }
+
+    /// The box an image is encoded into: the content width less the review screen's
+    /// two-column indent, [`IMAGE_ROWS`] tall.
+    fn image_box(&self) -> Size {
+        Size {
+            width: self.viewport.0.saturating_sub(2),
+            height: IMAGE_ROWS,
+        }
+    }
+
+    /// Whether the card on screen has a sound on either side, for the `r` hint.
+    ///
+    /// Read off the card's own embeds, not the loaded media: the answer side is not
+    /// resolved until the reveal, and the hint has to stand from the first frame.
+    pub fn card_has_audio(&self) -> bool {
+        let Some(cur) = self.review.current.as_ref() else {
+            return false;
+        };
+        [&cur.card.body.question, &cur.card.body.answer]
+            .into_iter()
+            .flatten()
+            .any(|segment| match segment {
+                Segment::Text(_) => false,
+                Segment::Embed(embed) => kind_of(&embed.target) == MediaKind::Audio,
+            })
+    }
+
+    /// Whether `target` is the sound running right now, for the ` · playing` mark.
+    pub fn audio_playing(&self, target: &str) -> bool {
+        self.audio.is_playing() && self.last_played_target.as_deref() == Some(target)
+    }
+
+    /// Silence the card, then play `side`.
+    fn play_side(&mut self, side: Side) {
+        self.audio.stop();
+        self.start_side(side);
+    }
+
+    /// Queue every resolved sound of `side` behind what is already playing, without
+    /// silencing first: two embeds on one side, and both sides of a replay, follow
+    /// each other. An unresolved sound is skipped in silence; a device or decode
+    /// failure marks its line and becomes a status line, never an error.
+    fn start_side(&mut self, side: Side) {
+        let mut started = None;
+        let mut status = None;
+        if let Some(cur) = self.review.current.as_mut() {
+            let media = match side {
+                Side::Question => &mut cur.media.question,
+                Side::Answer => &mut cur.media.answer,
+            };
+            for item in media.iter_mut() {
+                let Media::Audio { target, path: Some(path), failed } = item else {
+                    continue;
+                };
+                match self.audio.play(&self.root.join(&*path)) {
+                    Ok(()) => {
+                        *failed = false;
+                        started = Some(target.clone());
+                    }
+                    Err(e) => {
+                        *failed = true;
+                        status = Some(format!("audio · {}", e.root_cause()));
+                    }
+                }
+            }
+        }
+        if let Some(target) = started {
+            self.last_played_target = Some(target);
+        }
+        if let Some(status) = status {
+            // Through `set_status`, so `tick` stops following the newest grade: the
+            // sync countdown would otherwise overwrite this before it is ever drawn.
+            self.set_status(Some(status));
+        }
+    }
+
+    /// `r`: play the card again — the question, then the answer once it is revealed,
+    /// one behind the other. One stop at the front, none between the sides.
+    fn replay(&mut self) {
+        self.audio.stop();
+        self.start_side(Side::Question);
+        if self.review.revealed {
+            self.start_side(Side::Answer);
+        }
+    }
+
+    /// Show the answer: its media is resolved here, once, and its sounds play.
+    /// A second `space` changes nothing — replaying is what `r` is for.
+    fn reveal(&mut self) {
+        if self.review.current.is_none() || self.review.revealed {
+            return;
+        }
+        self.review.revealed = true;
+        let image_box = self.image_box();
+        if let Some(cur) = self.review.current.as_mut() {
+            cur.media.answer =
+                load_side(&self.picker, &self.media_index, &cur.card.body.answer, image_box);
+        }
+        self.play_side(Side::Answer);
+    }
+
     /// A bracketed paste: appended to the open text prompt as one line. Ignored otherwise.
     pub fn paste(&mut self, text: &str) {
         if let Some(t) = self.text_prompt.as_mut() {
@@ -516,7 +685,10 @@ impl App {
             return self.handle_read_key(key, mods);
         }
         match key {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => {
+                self.audio.stop();
+                self.should_quit = true;
+            }
             KeyCode::Tab | KeyCode::BackTab => self.cycle_screen()?,
             _ => match self.screen {
                 Screen::Queue => self.handle_queue_key(key)?,
@@ -893,6 +1065,7 @@ impl App {
 
     /// Open an article on the read screen at its read-point.
     fn open_read(&mut self, sm_id: i64) -> Result<()> {
+        self.audio.stop();
         let item = self
             .db
             .item(sm_id)?
@@ -972,6 +1145,7 @@ impl App {
                 self.screen = Screen::Queue;
             }
             (KeyCode::Char('q'), false) => {
+                self.audio.stop();
                 self.save_read_pos()?;
                 self.should_quit = true;
             }
@@ -1160,11 +1334,7 @@ impl App {
             Phase::Main => {}
         }
         match key {
-            KeyCode::Char(' ') => {
-                if self.review.current.is_some() {
-                    self.review.revealed = true;
-                }
-            }
+            KeyCode::Char(' ') => self.reveal(),
             KeyCode::Char(c @ '0'..='5') => {
                 if self.review.revealed {
                     let grade = c as u8 - b'0';
@@ -1172,6 +1342,7 @@ impl App {
                 }
             }
             KeyCode::Char('u') => self.undo()?,
+            KeyCode::Char('r') => self.replay(),
             _ => {}
         }
         Ok(())
@@ -1201,17 +1372,14 @@ impl App {
     /// Reveal and grade in the drill. There is no undo: the grades were never written.
     fn handle_drill_key(&mut self, key: KeyCode) -> Result<()> {
         match key {
-            KeyCode::Char(' ') => {
-                if self.review.current.is_some() {
-                    self.review.revealed = true;
-                }
-            }
+            KeyCode::Char(' ') => self.reveal(),
             KeyCode::Char(c @ '0'..='5') => {
                 if self.review.revealed {
                     self.drill_grade(c as u8 - b'0')?;
                 }
             }
             KeyCode::Char('u') => self.set_status(Some("no undo in drill".to_string())),
+            KeyCode::Char('r') => self.replay(),
             _ => {}
         }
         Ok(())
@@ -1238,7 +1406,10 @@ impl App {
     fn cycle_screen(&mut self) -> Result<()> {
         match self.screen {
             Screen::Queue => self.load_current()?,
-            Screen::Review | Screen::Read => self.screen = Screen::Queue,
+            Screen::Review | Screen::Read => {
+                self.audio.stop();
+                self.screen = Screen::Queue;
+            }
         }
         Ok(())
     }
@@ -1247,6 +1418,7 @@ impl App {
     /// A jump always shows the chosen item, so it leaves the drill prompt and the drill
     /// itself; the drill list survives and the prompt returns when the pass runs out again.
     fn jump_to(&mut self, sm_id: i64) -> Result<()> {
+        self.audio.stop();
         self.review.phase = Phase::Main;
         match self.review.due.iter().position(|&id| id == sm_id) {
             Some(idx) => self.review.pos = idx,
@@ -1270,6 +1442,7 @@ impl App {
         }
         self.review.revealed = false;
         let Some(&sm_id) = self.review.due.get(self.review.pos) else {
+            self.audio.stop();
             self.review.current = None;
             self.screen = Screen::Review;
             if self.review.phase == Phase::Main && !self.review.drill.is_empty() {
@@ -1284,10 +1457,21 @@ impl App {
         match item.kind {
             ItemType::Card => {
                 let card = load_card(&self.root, &item.path)?;
-                self.review.current = Some(CurrentCard { item, card });
+                let media = SideMedia {
+                    question: load_side(
+                        &self.picker,
+                        &self.media_index,
+                        &card.body.question,
+                        self.image_box(),
+                    ),
+                    answer: Vec::new(),
+                };
+                self.review.current = Some(CurrentCard { item, card, media });
                 self.screen = Screen::Review;
+                self.play_side(Side::Question);
             }
             ItemType::Article => {
+                self.audio.stop();
                 self.review.current = None;
                 self.open_read(sm_id)?;
             }
@@ -1299,6 +1483,7 @@ impl App {
     fn load_drill_card(&mut self) -> Result<()> {
         self.review.revealed = false;
         let Some(&sm_id) = self.review.drill.first() else {
+            self.audio.stop();
             self.review.phase = Phase::Main;
             self.review.current = None;
             self.screen = Screen::Review;
@@ -1309,8 +1494,13 @@ impl App {
             .item(sm_id)?
             .with_context(|| format!("sm_id {sm_id} vanished from the index"))?;
         let card = load_card(&self.root, &item.path)?;
-        self.review.current = Some(CurrentCard { item, card });
+        let media = SideMedia {
+            question: load_side(&self.picker, &self.media_index, &card.body.question, self.image_box()),
+            answer: Vec::new(),
+        };
+        self.review.current = Some(CurrentCard { item, card, media });
         self.screen = Screen::Review;
+        self.play_side(Side::Question);
         Ok(())
     }
 
@@ -1330,6 +1520,9 @@ impl App {
         let journal_id = self
             .db
             .insert_grade(sm_id, grade, &graded_at.to_rfc3339_opts(SecondsFormat::Secs, true))?;
+        // After the commit, never before it: the journal row is what the UI advances on,
+        // and silencing the card is part of advancing.
+        self.audio.stop();
         self.review.history.push(Graded {
             journal_id,
             sm_id,
@@ -1365,6 +1558,7 @@ impl App {
     /// Remove the newest unsynced grade of this session and go back to that card.
     /// Refused, with the entry left on the stack, once the grade has been sent to the server.
     fn undo(&mut self) -> Result<()> {
+        self.audio.stop();
         let Some(last) = self.review.history.last().copied() else {
             self.set_status(Some("nothing to undo".to_string()));
             return Ok(());
@@ -1390,7 +1584,9 @@ impl App {
         // since this grade; `pos` is the fallback for an item no longer in the list.
         self.review.pos = self.review.due.iter().position(|&id| id == last.sm_id).unwrap_or(last.pos);
         self.load_current()?;
-        self.review.revealed = true;
+        // The card comes back open, so its answer media is resolved and played again;
+        // the undo message is the one that stands afterwards.
+        self.reveal();
         self.set_status(Some(format!("undid grade {}", last.grade)));
         Ok(())
     }
@@ -3072,5 +3268,239 @@ mod tests {
         let app = App::open(dir.path(), today()).unwrap();
         assert_eq!(app.refresh.allocated, 0);
         assert_eq!(app.refresh.unchanged, 8);
+    }
+
+    // ---- M6 media ----
+
+    use crate::media::{test_picker, AudioLog, Media, NullAudio};
+    use std::sync::{Arc, Mutex};
+
+    /// A card whose question carries the sound, the mirror of `pomelo.md`.
+    /// No `due`, so it is due today; no `prio`, so it sorts at 50, behind yuzu.
+    const Q_AUDIO: (&str, &str) =
+        ("q-audio.md", "---\ntype: card\n---\nQ: hear\n![[pomelo.mp3]]\n\nA: ok\n");
+
+    /// A temp copy of the whole fixture vault, `media/` included: the older helpers
+    /// copy only the top-level files, and every embed here has to resolve to a file.
+    /// `files` are written on top, before the index is built.
+    fn media_vault(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/vault");
+        for entry in walkdir::WalkDir::new(&src)
+            .into_iter()
+            .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        {
+            let entry = entry.unwrap();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let rel = entry.path().strip_prefix(&src).unwrap();
+            let dest = dir.path().join(rel);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::copy(entry.path(), &dest).unwrap();
+        }
+        for (name, body) in files {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        dir
+    }
+
+    /// An app over that vault with the halfblocks picker, an 80x24 viewport and an
+    /// audio backend that opens no device but records what it was asked to do.
+    fn media_app(files: &[(&str, &str)]) -> (tempfile::TempDir, App, Arc<Mutex<AudioLog>>) {
+        let dir = media_vault(files);
+        let mut app = App::open(dir.path(), today()).unwrap();
+        app.set_picker(test_picker());
+        let (audio, log) = NullAudio::new();
+        app.set_audio(Box::new(audio));
+        app.set_viewport(80, 24);
+        (dir, app, log)
+    }
+
+    fn question(app: &App) -> &[Media] {
+        &app.review.current.as_ref().unwrap().media.question
+    }
+
+    fn answer(app: &App) -> &[Media] {
+        &app.review.current.as_ref().unwrap().media.answer
+    }
+
+    fn plays(log: &Arc<Mutex<AudioLog>>) -> Vec<String> {
+        log.lock().unwrap().plays.clone()
+    }
+
+    fn stops(log: &Arc<Mutex<AudioLog>>) -> usize {
+        log.lock().unwrap().stops
+    }
+
+    #[test]
+    fn opening_pomelo_encodes_the_question_image_only() {
+        let (_d, mut app, _log) = media_app(&[]);
+        open_from_table(&mut app, "pomelo.md");
+
+        assert_eq!(question(&app).len(), 1, "{:?}", question(&app));
+        match &question(&app)[0] {
+            Media::Image { target, protocol, note } => {
+                assert_eq!(target, "pomelo.png");
+                assert!(protocol.is_some(), "the question image is encoded on load");
+                assert_eq!(*note, None);
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+        assert!(answer(&app).is_empty(), "the answer side waits for space");
+        assert!(app.card_has_audio(), "the r hint stands before the reveal");
+
+        press(&mut app, ' ');
+        assert_eq!(answer(&app).len(), 1, "{:?}", answer(&app));
+        match &answer(&app)[0] {
+            Media::Audio { target, path, failed } => {
+                assert_eq!(target, "pomelo.mp3");
+                assert_eq!(path.as_deref(), Some("media/pomelo.mp3"));
+                assert!(!failed);
+            }
+            other => panic!("expected audio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn answer_audio_plays_on_reveal_and_r_replays() {
+        let (_d, mut app, log) = media_app(&[]);
+        open_from_table(&mut app, "pomelo.md");
+        assert!(plays(&log).is_empty(), "nothing plays before the reveal");
+
+        press(&mut app, ' ');
+        let played = plays(&log);
+        assert_eq!(played.len(), 1, "{played:?}");
+        assert!(played[0].ends_with("media/pomelo.mp3"), "{}", played[0]);
+
+        press(&mut app, ' ');
+        assert_eq!(plays(&log).len(), 1, "a second space is not a replay");
+
+        press(&mut app, 'r');
+        assert_eq!(plays(&log).len(), 2, "r replays the revealed answer");
+
+        press(&mut app, '4');
+        assert!(stops(&log) >= 1, "grading stops the sound");
+        assert_eq!(plays(&log).len(), 2, "the next card has no sound of its own");
+    }
+
+    #[test]
+    fn question_audio_plays_on_show() {
+        let (_d, mut app, log) = media_app(&[Q_AUDIO]);
+        open_from_table(&mut app, "q-audio.md");
+
+        let played = plays(&log);
+        assert_eq!(played.len(), 1, "{played:?}");
+        assert!(played[0].ends_with("media/pomelo.mp3"), "{}", played[0]);
+
+        assert!(!app.review.revealed);
+        press(&mut app, 'r');
+        assert_eq!(plays(&log).len(), 2, "r replays the question before the reveal");
+    }
+
+    #[test]
+    fn undo_replays_and_transitions_stop() {
+        let (_d, mut app, log) = media_app(&[]);
+        open_from_table(&mut app, "pomelo.md");
+        press(&mut app, ' ');
+        press(&mut app, '4');
+        let before = plays(&log).len();
+
+        press(&mut app, 'u');
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "pomelo.md");
+        assert!(app.review.revealed, "undo returns to the card revealed");
+        assert!(plays(&log).len() > before, "the answer sounds again");
+
+        let stopped = stops(&log);
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.screen, Screen::Queue);
+        assert!(stops(&log) > stopped, "leaving review stops the sound");
+
+        let quiet = plays(&log).len();
+        press(&mut app, 'j');
+        assert_eq!(plays(&log).len(), quiet, "the table plays nothing");
+    }
+
+    #[test]
+    fn card_has_audio_and_playing_track_the_current_sound() {
+        let (_d, mut app, log) = media_app(&[]);
+        open_from_table(&mut app, "pomelo.md");
+        press(&mut app, ' ');
+
+        assert!(app.card_has_audio(), "the answer carries the sound");
+        assert!(!app.audio_playing("pomelo.mp3"), "nothing is running yet");
+
+        log.lock().unwrap().playing = true;
+        assert!(app.audio_playing("pomelo.mp3"));
+        assert!(!app.audio_playing("other.mp3"), "only the target last started");
+
+        open_from_table(&mut app, "kumquat.md");
+        assert!(!app.card_has_audio(), "a card with no embeds has no sound");
+    }
+
+    #[test]
+    fn audio_failure_becomes_a_status() {
+        let (_d, mut app, log) = media_app(&[]);
+        log.lock().unwrap().fail_with = Some("no device".to_string());
+        open_from_table(&mut app, "pomelo.md");
+
+        press(&mut app, ' ');
+
+        assert_eq!(app.review.status.as_deref(), Some("audio · no device"));
+        match &answer(&app)[0] {
+            Media::Audio { failed, .. } => assert!(*failed, "the line remembers the failure"),
+            other => panic!("expected audio, got {other:?}"),
+        }
+    }
+
+    /// Like `media_app`, but syncing: only then does `tick` rewrite the status line
+    /// of the newest grade, which is what an audio failure must not be buried under.
+    fn synced_media_app(files: &[(&str, &str)]) -> (tempfile::TempDir, App, Arc<Mutex<AudioLog>>) {
+        let dir = media_vault(files);
+        let mut app =
+            App::open_with_scheduler(dir.path(), today(), Box::new(FakeScheduler::always_ok()))
+                .unwrap();
+        app.set_picker(test_picker());
+        let (audio, log) = NullAudio::new();
+        app.set_audio(Box::new(audio));
+        app.set_viewport(80, 24);
+        (dir, app, log)
+    }
+
+    #[test]
+    fn an_audio_failure_outlives_the_grade_it_follows() {
+        let (_d, mut app, log) = synced_media_app(&[Q_AUDIO]);
+        // finger-lime has no media and is the item before q-audio in the pass.
+        open_from_table(&mut app, "finger-lime.md");
+        log.lock().unwrap().fail_with = Some("no device".to_string());
+
+        press(&mut app, ' ');
+        press(&mut app, '4');
+
+        assert_eq!(app.review.current.as_ref().unwrap().item.path, "q-audio.md");
+        assert_eq!(status(&app), "audio · no device", "the failure replaces the grade line");
+        tick(&mut app, Duration::from_secs(1));
+        assert_eq!(status(&app), "audio · no device", "and the sync countdown does not bury it");
+    }
+
+    #[test]
+    fn viewport_unset_means_no_protocol() {
+        let dir = media_vault(&[]);
+        let mut app = App::open(dir.path(), today()).unwrap();
+        app.set_picker(test_picker());
+        let (audio, _log) = NullAudio::new();
+        app.set_audio(Box::new(audio));
+
+        open_from_table(&mut app, "pomelo.md");
+
+        match &question(&app)[0] {
+            Media::Image { protocol, note, .. } => {
+                assert!(protocol.is_none(), "no viewport, no room, no encode");
+                assert_eq!(*note, None, "a plain placeholder, not a failure");
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
     }
 }
