@@ -204,6 +204,12 @@ pub fn write_done(root: &Path, rel_path: &str, done: NaiveDate) -> Result<i64> {
     rewrite(root, rel_path, |doc| doc.set_done(done))
 }
 
+/// Write `due` alone, the only vault write a postpone makes (M9). `interval` is
+/// left as it is, since nothing was reviewed. Returns the new mtime.
+pub fn write_due(root: &Path, rel_path: &str, due: NaiveDate) -> Result<i64> {
+    rewrite(root, rel_path, |doc| doc.set_due(due))
+}
+
 /// Create a child of `parent` (an extract when `kind` is an article, a cloze when it
 /// is a card) at `<parent stem>/<n>.md`, index it, and return its row. The parent
 /// file is not touched. `body` is the whole body text; `range` the span of the
@@ -521,6 +527,37 @@ mod tests {
         let (dir, _db) = setup();
         let due = chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
         let err = write_schedule(dir.path(), "nope.md", due, 1).unwrap_err().to_string();
+        assert!(err.contains("nope.md"), "{err}");
+    }
+
+    #[test]
+    fn write_due_rewrites_only_due_and_returns_new_mtime() {
+        let (dir, db) = setup();
+        write(
+            dir.path(),
+            "a.md",
+            "---\ntype: card\nsm_id: 10\ndue: 2026-09-01\ninterval: 3\nprio: 30\ncustom: keep\n---\nQ: alpha?\n\nA: a\n",
+        );
+        refresh(dir.path(), &db).unwrap();
+        let due = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let mtime = write_due(dir.path(), "a.md", due).unwrap();
+        let text = fs::read_to_string(dir.path().join("a.md")).unwrap();
+        assert_eq!(
+            text,
+            "---\ntype: card\nsm_id: 10\ndue: 2026-09-21\ninterval: 3\nprio: 30\ncustom: keep\n---\nQ: alpha?\n\nA: a\n",
+            "{text}"
+        );
+        assert!(text.contains("interval: 3\n"), "interval is never rewritten: {text}");
+        assert!(text.contains("custom: keep\n"), "{text}");
+        assert!(text.ends_with("---\nQ: alpha?\n\nA: a\n"), "body unchanged: {text}");
+        assert_eq!(mtime, mtime_of(&dir.path().join("a.md")).unwrap());
+    }
+
+    #[test]
+    fn write_due_on_missing_file_names_the_path() {
+        let (dir, _db) = setup();
+        let due = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let err = write_due(dir.path(), "nope.md", due).unwrap_err().to_string();
         assert!(err.contains("nope.md"), "{err}");
     }
 

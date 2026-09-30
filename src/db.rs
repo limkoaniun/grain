@@ -320,6 +320,16 @@ impl Db {
         )
     }
 
+    /// M9 auto-postpone candidates: active items dated strictly before `today`, in
+    /// queue order. Undated items are never overdue.
+    pub fn overdue_items(&self, today: NaiveDate) -> Result<Vec<ItemRow>> {
+        self.select_items(
+            "WHERE done IS NULL AND due IS NOT NULL AND due < ?1
+             ORDER BY prio ASC, due ASC, sm_id ASC",
+            &[&today.to_string()],
+        )
+    }
+
     /// Every row, done ones included; unordered by queue position. For the stats screen.
     pub fn all_items(&self) -> Result<Vec<ItemRow>> {
         self.select_items("ORDER BY sm_id ASC", &[])
@@ -346,6 +356,16 @@ impl Db {
             params![sm_id, read_pos, mtime],
         )
         .with_context(|| format!("saving read_pos for sm_id {sm_id}"))?;
+        Ok(())
+    }
+
+    /// M9 auto-postpone: rewrite `due` after a postpone decision. `interval` is untouched.
+    pub fn set_due(&self, sm_id: i64, due: NaiveDate, mtime: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET due = ?2, mtime = ?3 WHERE sm_id = ?1",
+            params![sm_id, due.to_string(), mtime],
+        )
+        .with_context(|| format!("postponing sm_id {sm_id}"))?;
         Ok(())
     }
 
@@ -699,6 +719,21 @@ mod tests {
     }
 
     #[test]
+    fn overdue_items_are_dated_before_today_active_in_queue_order() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_item(&card(1, "a.md", 60, Some("2026-09-01"))).unwrap();
+        db.upsert_item(&card(2, "b.md", 35, Some("2026-09-10"))).unwrap();
+        db.upsert_item(&card(3, "c.md", 10, Some("2026-09-20"))).unwrap(); // today, excluded
+        db.upsert_item(&card(4, "d.md", 5, None)).unwrap(); // undated, excluded
+        let mut done = card(5, "e.md", 1, Some("2026-09-01"));
+        done.done = Some(d("2026-09-15"));
+        db.upsert_item(&done).unwrap(); // done, excluded
+        db.upsert_item(&card(6, "f.md", 70, Some("2026-09-25"))).unwrap(); // future, excluded
+        let ids: Vec<i64> = db.overdue_items(d("2026-09-20")).unwrap().iter().map(|i| i.sm_id).collect();
+        assert_eq!(ids, [2, 1], "strictly before today, undated/done/future/today excluded, prio ASC then due ASC");
+    }
+
+    #[test]
     fn delete_missing_removes_rows_but_keeps_journal() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_item(&card(1, "keep.md", 50, None)).unwrap();
@@ -970,6 +1005,19 @@ mod tests {
         let row = db.item(1).unwrap().unwrap();
         assert_eq!((row.done, row.mtime), (Some(d("2026-09-30")), 504));
         assert!(db.queue().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_due_updates_due_and_mtime_only() {
+        let db = Db::open_in_memory().unwrap();
+        let mut c = card(1, "a.md", 50, Some("2026-09-10"));
+        c.interval = Some(3);
+        db.upsert_item(&c).unwrap();
+        db.set_due(1, d("2026-09-21"), 777).unwrap();
+        let row = db.item(1).unwrap().unwrap();
+        assert_eq!(row.due, Some(d("2026-09-21")));
+        assert_eq!(row.mtime, 777);
+        assert_eq!(row.interval, Some(3));
     }
 
     #[test]
