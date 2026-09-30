@@ -3,9 +3,9 @@
 A terminal spaced-repetition and incremental-reading app. Your knowledge lives as plain
 markdown files in an Obsidian-compatible vault; grain is the review engine on top.
 
-Status: **M0**. Fully offline. Open a vault, index it, show a queue, review cards, journal
-every grade, quit. Scheduling through the SuperMemo API, a reading screen, images, audio,
-and collection import come in later milestones.
+Status: **M10**. Learn session with final drill, SuperMemo API scheduling (offline
+without a key), incremental reading with extracts and clozes, add and import, pictures
+and sound, a stats screen, auto-postpone, and a config file with a settings screen.
 
 ## Run
 
@@ -14,10 +14,21 @@ Requires Rust 1.88 or newer.
 ```sh
 cargo run -- --vault fixtures/vault     # sample vault: 6 cards, 2 articles
 cargo run -- --vault ~/notes            # your own vault (default: ./vault)
+cargo install --path .                  # puts `grain` on your PATH (~/.cargo/bin)
+grain                                   # opens the vault named in ~/.config/grain/config
 ```
 
+grain reads `~/.config/grain/config` (or `$XDG_CONFIG_HOME/grain/config`;
+`GRAIN_CONFIG=<path>` overrides), plain `key = value` lines: `vault` (default `./vault`),
+`postpone` (default `50`, or `off`), `final_drill` (default `ask`; `on` drills without
+asking, `off` skips the drill), `collection` (default `all`, the name in the status row).
+Press `o` on the table to edit them from inside grain. `--vault` and `--postpone` override
+the file for one launch.
+
 The first run allocates an `sm_id` for any file missing one and writes it back into the
-file's frontmatter. That is the only time grain edits your notes.
+file's frontmatter. Later writes are `due`/`interval`, `read_pos`, `prio` and `done` on
+the file itself, plus new child, added and imported files, always through the frontmatter
+round-trip that keeps every other key intact.
 
 ## Keys
 
@@ -91,10 +102,9 @@ cargo clippy --all-targets
 
 ## Roadmap
 
-- M1: SuperMemo API client (SM-20 scheduling). Grades already journal locally first; the
-  sync happens after the commit.
-- M2: incremental-reading screen for articles.
-- Later: images (ratatui-image), audio (rodio), SuperMemo collection import.
+- Manual Postpone and Mercy, postpone count and skip conditions.
+- Cloze hints and several blanks per card.
+- SuperMemo collection import, monthly workload and the workload graph.
 
 ## License
 

@@ -6,6 +6,7 @@
 mod queue;
 mod read;
 mod review;
+mod settings;
 mod stats;
 
 use chrono::NaiveDate;
@@ -20,7 +21,6 @@ use crate::app::{App, Phase, Screen, TextStage};
 
 /// Amber for key letters in the hints row (256-color index, works without truecolor).
 pub const AMBER: Color = Color::Indexed(214);
-pub const COLLECTION_NAME: &str = "all";
 /// The caret drawn at the end of an open text prompt (U+258F).
 const CARET: char = '▏';
 
@@ -54,18 +54,39 @@ pub fn render(frame: &mut Frame, app: &App) {
     });
     match app.screen {
         Screen::Queue => {
-            status_row(frame, top, middle.as_deref(), &app.queue_context(), app.progress());
+            status_row(
+                frame,
+                top,
+                app.collection_name(),
+                middle.as_deref(),
+                &app.queue_context(),
+                app.progress(),
+            );
             queue::render(frame, content, app);
             let base = if prompt_open { PROMPT_HINTS } else { queue::HINTS };
             hints_row(frame, hints, text_hints.unwrap_or(base));
         }
         Screen::Review => {
-            status_row(frame, top, middle.as_deref(), &app.review_context(), app.progress());
+            status_row(
+                frame,
+                top,
+                app.collection_name(),
+                middle.as_deref(),
+                &app.review_context(),
+                app.progress(),
+            );
             review::render(frame, content, app);
             hints_row(frame, hints, text_hints.unwrap_or_else(|| review_hints(app)));
         }
         Screen::Read => {
-            status_row(frame, top, middle.as_deref(), &app.read_context(), app.progress());
+            status_row(
+                frame,
+                top,
+                app.collection_name(),
+                middle.as_deref(),
+                &app.read_context(),
+                app.progress(),
+            );
             read::render(frame, content, app);
             let base = if prompt_open {
                 PROMPT_HINTS
@@ -78,9 +99,29 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
         // No prompt can be open on the stats screen, so the hints never change.
         Screen::Stats => {
-            status_row(frame, top, middle.as_deref(), &app.stats_context(), app.progress());
+            status_row(
+                frame,
+                top,
+                app.collection_name(),
+                middle.as_deref(),
+                &app.stats_context(),
+                app.progress(),
+            );
             stats::render(frame, content, app);
             hints_row(frame, hints, stats::HINTS);
+        }
+        // Editing a setting opens the text prompt, which takes the status and hints rows.
+        Screen::Settings => {
+            status_row(
+                frame,
+                top,
+                app.collection_name(),
+                middle.as_deref(),
+                &app.settings_context(),
+                app.progress(),
+            );
+            settings::render(frame, content, app);
+            hints_row(frame, hints, text_hints.unwrap_or(settings::HINTS));
         }
     }
 }
@@ -142,11 +183,12 @@ fn rule(frame: &mut Frame, area: Rect) {
 fn status_row(
     frame: &mut Frame,
     area: Rect,
+    collection: &str,
     notice: Option<&str>,
     context: &str,
     progress: Option<(usize, usize)>,
 ) {
-    let mut left_spans = vec![Span::from(COLLECTION_NAME).bold()];
+    let mut left_spans = vec![Span::from(collection).bold()];
     if let Some((reached, len)) = progress.filter(|&(_, len)| len > 0) {
         // At most twenty cells; `reached` rounds to the nearest one.
         let cells = len.min(20);
@@ -250,6 +292,7 @@ mod tests {
 
     use super::*;
     use crate::app::App;
+    use crate::config::{Config, Key};
     use crate::media::{test_picker, AudioLog, NullAudio};
     use chrono::NaiveDate;
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -517,6 +560,20 @@ mod tests {
     }
 
     #[test]
+    fn status_row_shows_the_configured_collection_on_every_screen() {
+        let (_d, mut app) = fixture_app();
+        let mut config = Config::default();
+        config.set(Key::Collection, "citrus").unwrap();
+        app.set_config(config, None);
+
+        assert!(rows(&app)[0].starts_with("citrus"), "session: {:?}", rows(&app)[0]);
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert!(rows(&app)[0].starts_with("citrus"), "queue: {:?}", rows(&app)[0]);
+        app.handle_key(KeyCode::Char('s')).unwrap();
+        assert!(rows(&app)[0].starts_with("citrus"), "stats: {:?}", rows(&app)[0]);
+    }
+
+    #[test]
     fn note_box_draws_a_rounded_frame_and_falls_back_when_small() {
         let (_d, app) = vault_with(&["pomelo.md", "buddhas-hand.md"]);
         let all = rows(&app).join("\n");
@@ -558,8 +615,8 @@ mod tests {
         assert!(r[23].contains("q quit"), "{:?}", r[23]);
         assert_eq!(
             r[23],
-            "j/k move · enter open · a add · i import · s stats · p prio · tab learn · q quit",
-            "p is a queue key (M2), a and i are M5, s is M8"
+            "enter open · a add · i import · s stats · o config · p prio · tab learn · q quit",
+            "p is a queue key (M2), a and i are M5, s is M8, o is M10"
         );
         assert!(!r.iter().any(|l| l.contains('│') || l.contains('┌')), "no borders");
     }
@@ -1266,7 +1323,7 @@ mod tests {
         let r = rows(&app);
         assert_eq!(
             r[23],
-            "j/k move · enter open · a add · i import · s stats · p prio · tab learn · q quit"
+            "enter open · a add · i import · s stats · o config · p prio · tab learn · q quit"
         );
         let add = r[23].find("a add").unwrap();
         let import = r[23].find("i import").unwrap();
@@ -1737,7 +1794,7 @@ mod tests {
         let r = rows(&app);
         assert_eq!(
             r[23],
-            "j/k move · enter open · a add · i import · s stats · p prio · tab learn · q quit"
+            "enter open · a add · i import · s stats · o config · p prio · tab learn · q quit"
         );
         let import = r[23].find("i import").unwrap();
         let stats = r[23].find("s stats").unwrap();
@@ -1749,6 +1806,196 @@ mod tests {
         walk_to_prompt(&mut app, ['2', '4', '4', '4']);
         assert!(!rows(&app)[23].contains("s stats"), "{:?}", rows(&app)[23]);
         app.handle_key(KeyCode::Char('n')).unwrap();
+        assert_eq!(rows(&app)[23], "tab queue · s stats · q quit");
+    }
+
+    /// Every hint row must fit the 80 columns the project renders at: the queue row is
+    /// the widest and was already exactly 80 cells before `o config` joined it, so a new
+    /// hint has to displace an old one instead of pushing `q quit` off the screen.
+    #[test]
+    fn hint_rows_fit_eighty_columns() {
+        let rows_of_hints = [
+            queue::HINTS,
+            review::HINTS,
+            review::HINTS_AUDIO,
+            review::DRILL_PROMPT_HINTS,
+            review::DRILL_HINTS,
+            review::DRILL_HINTS_AUDIO,
+            review::DONE_HINTS,
+            read::HINTS,
+            read::SELECT_HINTS,
+            settings::HINTS,
+            stats::HINTS,
+            PROMPT_HINTS,
+            TEXT_PROMPT_NEXT_HINTS,
+            TEXT_PROMPT_SAVE_HINTS,
+        ];
+        for hints in rows_of_hints {
+            // `hints_row`'s own arithmetic: `key label` per entry, ` · ` between them.
+            let width: usize = hints
+                .iter()
+                .map(|(k, l)| k.chars().count() + 1 + l.chars().count())
+                .sum::<usize>()
+                + 3 * (hints.len() - 1);
+            assert!(width <= 80, "{width} cells is wider than 80: {hints:?}");
+        }
+
+        // And on screen: nothing is cut off the end of the queue row.
+        let (_d, mut app) = fixture_app();
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert!(rows(&app)[23].ends_with("q quit"), "{:?}", rows(&app)[23]);
+    }
+
+    // ---- settings screen (M10) ----
+
+    /// The fixture app on the settings screen, opened from the table, with a config
+    /// path whose file does not exist yet.
+    fn settings_app() -> (tempfile::TempDir, App) {
+        let (dir, mut app) = fixture_app();
+        let path = dir.path().join("config");
+        app.set_config(Config::default(), Some(path));
+        app.handle_key(KeyCode::Tab).unwrap();
+        app.handle_key(KeyCode::Char('o')).unwrap();
+        assert_eq!(app.screen, Screen::Settings);
+        (dir, app)
+    }
+
+    #[test]
+    fn settings_screen_lists_four_rows_with_marker_and_footer() {
+        let (dir, mut app) = settings_app();
+        let path = dir.path().join("config").display().to_string();
+        let buf = buffer_at(&app, 80, 24);
+        let r = rows_of(&buf);
+
+        assert!(r[0].ends_with("settings"), "the context sits at the row end: {:?}", r[0]);
+        assert_eq!(r[2], "▎ vault        vault  next launch", "{r:?}");
+        assert_eq!(r[3], "  postpone     50  next launch", "{r:?}");
+        assert_eq!(r[4], "  final drill  ask", "{r:?}");
+        assert_eq!(r[5], "  collection   all", "{r:?}");
+        assert_eq!(r[6], "", "one blank row under the rows: {r:?}");
+        assert_eq!(app.settings_footer(), format!("no config file · {path} will be created"));
+        assert!(r[7].starts_with("no config file · /"), "{r:?}");
+        assert_eq!(r[23], "j/k move · enter edit · o/esc back · q quit");
+        assert!(!r.iter().any(|l| l.contains('│') || l.contains('╭')), "no borders: {r:?}");
+
+        assert_eq!(buf[(0, 2)].symbol(), "▎");
+        assert_eq!(buf[(0, 2)].style().fg, Some(AMBER), "the marker is amber");
+        assert_eq!(buf[(0, 3)].symbol(), " ", "an unselected row has no marker");
+        assert!(buf[(2, 2)].style().add_modifier.contains(Modifier::DIM), "the label is dim");
+        let note = col_of(&r[2], "next launch");
+        assert!(buf[(note, 2)].style().add_modifier.contains(Modifier::DIM), "the note is dim");
+        let value = col_of(&r[4], "ask");
+        assert!(!buf[(value, 4)].style().add_modifier.contains(Modifier::DIM), "the value is plain");
+        assert!(
+            buf[(0, 7)].style().add_modifier.contains(Modifier::DIM),
+            "the footer is dim: {r:?}"
+        );
+
+        // `j` moves the marker one row down.
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        let r = rows_of(&buffer_at(&app, 80, 24));
+        assert_eq!(r[2], "  vault        vault  next launch", "{r:?}");
+        assert_eq!(r[3], "▎ postpone     50  next launch", "the marker moved: {r:?}");
+
+        // Once an edit has written the file, the footer is the path alone. A temp path
+        // is not under HOME, so it is shown whole.
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        app.handle_key(KeyCode::Enter).unwrap();
+        let r = rows_of(&buffer_at(&app, 80, 24));
+        assert_eq!(r[4], "▎ final drill  on", "the cycled value shows at once: {r:?}");
+        assert_eq!(app.settings_footer(), path, "a temp path is not under HOME: shown whole");
+        assert!(r[7].starts_with('/'), "the footer is the path alone: {r:?}");
+    }
+
+    /// The settings screen with `abc` refused as a postpone count: the prompt is still
+    /// open and the reason is waiting to be drawn.
+    fn refused_setting_app() -> (tempfile::TempDir, App) {
+        let (dir, mut app) = settings_app();
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        app.handle_key(KeyCode::Enter).unwrap();
+        for _ in 0..2 {
+            app.handle_key(KeyCode::Backspace).unwrap();
+        }
+        for c in "abc".chars() {
+            app.handle_key(KeyCode::Char(c)).unwrap();
+        }
+        app.handle_key(KeyCode::Enter).unwrap();
+        (dir, app)
+    }
+
+    /// A refused value keeps the prompt in the status row, so the reason cannot go there:
+    /// it takes the row under the footer, amber, until the next key clears it.
+    #[test]
+    fn refused_setting_value_shows_the_reason_under_the_footer() {
+        let (_d, mut app) = refused_setting_app();
+        let buf = buffer_at(&app, 80, 24);
+        let r = rows_of(&buf);
+        assert!(r[0].contains("postpone: abc▏"), "the prompt keeps the status row: {:?}", r[0]);
+        assert_eq!(r[8], "config · postpone expects a count or off", "{r:?}");
+        assert_eq!(buf[(0, 8)].style().fg, Some(AMBER), "the reason is amber, not dim");
+        assert_eq!(r[23], "enter save · esc cancel", "the prompt owns the hints row");
+
+        // Any key clears the notice; `esc` also closes the prompt.
+        app.handle_key(KeyCode::Esc).unwrap();
+        let r = rows_of(&buffer_at(&app, 80, 24));
+        assert_eq!(r[8], "", "the reason is gone on the next key: {r:?}");
+        assert_eq!(r[3], "▎ postpone     50  next launch", "the refused value never landed");
+    }
+
+    #[test]
+    fn settings_screen_survives_tiny_sizes() {
+        let (_d, app) = settings_app();
+        draw_tiny(&app);
+
+        // The notice row is the lowest one, so it is the first to run out of area.
+        let (_d2, app_notice) = refused_setting_app();
+        draw_tiny(&app_notice);
+        for h in [8u16, 9, 10] {
+            let r = rows_of(&buffer_at(&app_notice, 80, h));
+            assert!(!r.iter().any(|l| l.contains("expects a count")), "no room at {h}: {r:?}");
+        }
+        assert_eq!(
+            rows_of(&buffer_at(&app_notice, 80, 11))[8],
+            "config · postpone expects a count or off",
+            "seven content rows are just enough: four settings, blank, footer, notice"
+        );
+
+        // One content row: the first setting, no blank row and no footer.
+        let r = rows_of(&buffer_at(&app, 80, 5));
+        assert_eq!(r[2], "▎ vault        vault  next launch", "{r:?}");
+        assert!(!r.iter().any(|l| l.contains("no config file")), "no room for the footer: {r:?}");
+
+        for (w, h) in [(20u16, 3u16), (4, 24), (80, 8), (80, 9)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| render(f, &app)).unwrap();
+        }
+    }
+
+    /// `o config` is a table key only: the session, the finish line, the drill prompt and
+    /// the drill keep the rows they had, because the queue row is the only one with room.
+    #[test]
+    fn queue_hints_offer_config() {
+        let (_d, mut app) = fixture_app();
+        assert!(!rows(&app)[23].contains("o config"), "{:?}", rows(&app)[23]);
+
+        app.handle_key(KeyCode::Tab).unwrap();
+        let r = rows(&app);
+        assert_eq!(
+            r[23],
+            "enter open · a add · i import · s stats · o config · p prio · tab learn · q quit"
+        );
+        let stats = r[23].find("s stats").unwrap();
+        let config = r[23].find("o config").unwrap();
+        let prio = r[23].find("p prio").unwrap();
+        assert!(stats < config && config < prio, "o config follows s stats: {:?}", r[23]);
+
+        let (_d2, mut app) = fixture_app();
+        walk_to_prompt(&mut app, ['2', '4', '4', '4']);
+        assert_eq!(rows(&app)[23], "y drill · n finish · tab queue · q quit");
+        app.handle_key(KeyCode::Char('y')).unwrap();
+        assert_eq!(rows(&app)[23], "space reveal · 0-5 grade · tab queue · q quit");
+        app.handle_key(KeyCode::Char(' ')).unwrap();
+        app.handle_key(KeyCode::Char('4')).unwrap();
         assert_eq!(rows(&app)[23], "tab queue · s stats · q quit");
     }
 }

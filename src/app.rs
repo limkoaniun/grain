@@ -12,6 +12,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Size;
 use ratatui_image::picker::Picker;
 
+use crate::config::{Config, FinalDrill, Key};
 use crate::db::{Db, ItemRow, Schedule};
 use crate::media::{
     kind_of, load_embed, load_side, Audio, Media, MediaIndex, MediaKind, RodioAudio, SideMedia,
@@ -46,6 +47,7 @@ pub enum Screen {
     Review,
     Read,
     Stats,
+    Settings,
 }
 
 /// Default `a_factor` when the article has none, and the clamp applied on read.
@@ -178,6 +180,8 @@ enum TextKind {
     CardAnswer { question: String },
     /// `i`: the url or path of an article to import.
     Import,
+    /// `enter` on a settings row (M10): the new value of one config key.
+    Setting(Key),
 }
 
 /// The inline free-text prompt in the status row (M5): `a` and `i`.
@@ -303,6 +307,19 @@ pub struct App {
     picker: Picker,
     /// Where sounds go. The default opens no device until a card actually plays one.
     audio: Box<dyn Audio>,
+    /// The user's settings (M10). `Config::default()` until `main` injects the file's,
+    /// so `App::open*` never reads a config and tests never touch the real one.
+    config: Config,
+    /// Where an edited config is saved. `None` when there is no home directory.
+    config_path: Option<PathBuf>,
+    /// Whether `config_path` names an existing file, checked once in `set_config`:
+    /// the settings footer needs it and `ui/` does no I/O.
+    config_file_exists: bool,
+    /// `HOME` as of `set_config`, so the settings footer can show it as `~`. The one
+    /// env read outside `config.rs`; `ui/` is a pure function of `&App`.
+    home: Option<String>,
+    /// Which settings row is selected (M10), `0..=3` over `Key::ALL`.
+    settings_sel: usize,
     /// Terminal size as of the last frame, `(cols, rows)`; `(0, 0)` until `main` sets it.
     /// Only the width matters: it fixes the box an image is encoded into.
     viewport: (u16, u16),
@@ -417,6 +434,11 @@ impl App {
             pending_import: None,
             picker: Picker::halfblocks(),
             audio: Box::new(RodioAudio::new()),
+            config: Config::default(),
+            config_path: None,
+            config_file_exists: false,
+            home: None,
+            settings_sel: 0,
             viewport: (0, 0),
             media_index,
             last_played_target: None,
@@ -541,6 +563,48 @@ impl App {
         format!("stats · {total} items{}", self.unsynced_suffix())
     }
 
+    /// The collection name at the left of the status row on every screen (M10).
+    pub fn collection_name(&self) -> &str {
+        &self.config.collection
+    }
+
+    /// The status-row context on the settings screen (M10). The screen has no counts:
+    /// the four rows are the whole of it.
+    pub fn settings_context(&self) -> String {
+        "settings".to_string()
+    }
+
+    /// Which settings row is selected, for the marker.
+    pub fn settings_sel(&self) -> usize {
+        self.settings_sel
+    }
+
+    /// The four settings as `(label, value, note)`: the note says `next launch` on the
+    /// two that only take effect when grain starts again.
+    pub fn settings_rows(&self) -> [(&'static str, String, &'static str); 4] {
+        Key::ALL.map(|key| {
+            let note = match key {
+                Key::Vault | Key::Postpone => "next launch",
+                Key::FinalDrill | Key::Collection => "",
+            };
+            (key.label(), self.config.get(key), note)
+        })
+    }
+
+    /// The line under the settings rows: the file the edits go to, what will be created,
+    /// or why nothing can be saved.
+    pub fn settings_footer(&self) -> String {
+        let Some(path) = self.config_path.as_deref() else {
+            return "no config path · HOME is not set · edits are not saved".to_string();
+        };
+        let shown = short_home_path(path, self.home.as_deref());
+        if self.config_file_exists {
+            shown
+        } else {
+            format!("no config file · {shown} will be created")
+        }
+    }
+
     /// `(reached, len)` for the status-row progress bar during the main pass; `None` elsewhere.
     pub fn progress(&self) -> Option<(usize, usize)> {
         let len = self.review.due.len();
@@ -548,6 +612,7 @@ impl App {
             || self.review.phase != Phase::Main
             || self.screen == Screen::Queue
             || self.screen == Screen::Stats
+            || self.screen == Screen::Settings
         {
             return None;
         }
@@ -586,9 +651,10 @@ impl App {
         }
         let t = self.text_prompt.as_ref()?;
         let label = match t.kind {
-            TextKind::CardQuestion => "add card · Q: ",
-            TextKind::CardAnswer { .. } => "add card · A: ",
-            TextKind::Import => "import · url or path: ",
+            TextKind::CardQuestion => "add card · Q: ".to_string(),
+            TextKind::CardAnswer { .. } => "add card · A: ".to_string(),
+            TextKind::Import => "import · url or path: ".to_string(),
+            TextKind::Setting(key) => format!("{}: ", key.label()),
         };
         Some(format!("{label}{}", t.buf))
     }
@@ -597,8 +663,22 @@ impl App {
     pub fn text_prompt_stage(&self) -> Option<TextStage> {
         Some(match self.text_prompt.as_ref()?.kind {
             TextKind::CardQuestion => TextStage::Question,
-            TextKind::CardAnswer { .. } | TextKind::Import => TextStage::Final,
+            TextKind::CardAnswer { .. } | TextKind::Import | TextKind::Setting(_) => {
+                TextStage::Final
+            }
         })
+    }
+
+    /// Hand over the settings read at startup and the file they came from (M10).
+    /// `main` calls this once the app is open; tests pass a temp path or `None`.
+    ///
+    /// Whether the file exists is settled here, the one `fs` check outside `config.rs`:
+    /// the settings footer says so and `ui/` is a pure function of `&App`.
+    pub fn set_config(&mut self, config: Config, path: Option<PathBuf>) {
+        self.config_file_exists = path.as_deref().is_some_and(|p| p.is_file());
+        self.home = std::env::var("HOME").ok();
+        self.config = config;
+        self.config_path = path;
     }
 
     /// Swap the fetcher `i` pulls a URL through (tests).
@@ -784,17 +864,16 @@ impl App {
                 self.audio.stop();
                 self.should_quit = true;
             }
-            KeyCode::Tab | KeyCode::BackTab => {
-                if self.screen == Screen::Stats {
-                    self.close_stats()?;
-                } else {
-                    self.cycle_screen()?;
-                }
-            }
+            KeyCode::Tab | KeyCode::BackTab => match self.screen {
+                Screen::Stats => self.close_stats()?,
+                Screen::Settings => self.close_settings(),
+                _ => self.cycle_screen()?,
+            },
             _ => match self.screen {
                 Screen::Queue => self.handle_queue_key(key)?,
                 Screen::Review => self.handle_review_key(key)?,
                 Screen::Stats => self.handle_stats_key(key)?,
+                Screen::Settings => self.handle_settings_key(key),
                 Screen::Read => {}
             },
         }
@@ -997,6 +1076,7 @@ impl App {
             KeyCode::Char('a') => self.open_text_prompt(TextKind::CardQuestion),
             KeyCode::Char('i') => self.open_text_prompt(TextKind::Import),
             KeyCode::Char('s') => self.open_stats()?,
+            KeyCode::Char('o') => self.open_settings(),
             _ => {}
         }
         Ok(())
@@ -1055,6 +1135,15 @@ impl App {
                 self.text_prompt = None;
                 self.start_import(&text)?;
             }
+            // A refused value keeps the prompt open with the reason in the status row,
+            // so the typed text can be corrected instead of retyped.
+            TextKind::Setting(key) => match self.config.set(key, &text) {
+                Ok(()) => {
+                    self.text_prompt = None;
+                    self.save_config();
+                }
+                Err(e) => self.notice = Some(format!("config · {e}")),
+            },
         }
         Ok(())
     }
@@ -1545,8 +1634,9 @@ impl App {
                 self.audio.stop();
                 self.screen = Screen::Queue;
             }
-            // Unreachable through `handle_key_with`, which closes the stats screen itself.
+            // Unreachable through `handle_key_with`, which closes those screens itself.
             Screen::Stats => self.close_stats()?,
+            Screen::Settings => self.close_settings(),
         }
         Ok(())
     }
@@ -1587,6 +1677,66 @@ impl App {
         }
     }
 
+    // ---- settings screen (M10) ----
+
+    /// `o` on the table: show the four config settings. Nothing is read here — the config
+    /// is already in memory — so the screen cannot fail to open.
+    fn open_settings(&mut self) {
+        self.audio.stop();
+        self.settings_sel = 0;
+        self.screen = Screen::Settings;
+    }
+
+    /// Back to the table, the only screen `o` opens the settings from.
+    fn close_settings(&mut self) {
+        self.screen = Screen::Queue;
+    }
+
+    /// `o` and `esc` close the screen, `j`/`k` pick a row and `enter` edits it. `tab` and
+    /// `q` are handled before the screen sees the key; every other key is ignored.
+    fn handle_settings_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('o') | KeyCode::Esc => self.close_settings(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.settings_sel = (self.settings_sel + 1).min(Key::ALL.len() - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.settings_sel = self.settings_sel.saturating_sub(1);
+            }
+            KeyCode::Enter => self.edit_setting(),
+            _ => {}
+        }
+    }
+
+    /// `enter` on the selected row: the drill mode cycles in place, the other three open
+    /// the text prompt with the current value already typed.
+    fn edit_setting(&mut self) {
+        let Some(&key) = Key::ALL.get(self.settings_sel) else {
+            return;
+        };
+        if key == Key::FinalDrill {
+            self.config.final_drill = self.config.final_drill.next();
+            self.save_config();
+            return;
+        }
+        self.text_prompt = Some(TextPrompt {
+            kind: TextKind::Setting(key),
+            buf: self.config.get(key),
+        });
+    }
+
+    /// Write the config out after an edit. A failure keeps the in-memory value and says
+    /// so; with no path at all (no `HOME`) the edit only lives for this session.
+    fn save_config(&mut self) {
+        match &self.config_path {
+            Some(path) => match self.config.save(path) {
+                Ok(()) => self.config_file_exists = true,
+                Err(e) => self.notice = Some(format!("config · {e:#}")),
+            },
+            None => self.notice = Some("config · no home directory · not saved".to_string()),
+        }
+    }
+
     /// Jump the session to `sm_id`, inserting it at the current position if it is not due yet.
     /// A jump always shows the chosen item, so it leaves the drill prompt and the drill
     /// itself; the drill list survives and the prompt returns when the pass runs out again.
@@ -1607,7 +1757,8 @@ impl App {
 
     /// Show the item at `review.pos`: a card in review, an article on the read screen.
     /// Past the end of the main pass there is nothing to show, the screen stays review
-    /// and a non-empty drill list turns into the prompt. While drilling the list, not
+    /// and a non-empty drill list becomes the prompt, the drill itself or nothing,
+    /// depending on `config.final_drill` (M10). While drilling the list, not
     /// `review.pos`, says what to show, so `tab` back from the table resumes the drill.
     fn load_current(&mut self) -> Result<()> {
         if self.review.phase == Phase::Drilling {
@@ -1619,7 +1770,17 @@ impl App {
             self.review.current = None;
             self.screen = Screen::Review;
             if self.review.phase == Phase::Main && !self.review.drill.is_empty() {
-                self.review.phase = Phase::DrillPrompt;
+                // `final_drill` decides whether the offer is made at all (M10): the two
+                // decided modes take exactly the paths `y` and `n` take at the prompt.
+                match self.config.final_drill {
+                    FinalDrill::Ask => self.review.phase = Phase::DrillPrompt,
+                    FinalDrill::On => {
+                        self.set_status(None);
+                        self.review.phase = Phase::Drilling;
+                        return self.load_drill_card();
+                    }
+                    FinalDrill::Off => self.review.drill.clear(),
+                }
             }
             return Ok(());
         };
@@ -1789,11 +1950,26 @@ fn first_heading(text: &str) -> Option<String> {
     non_empty(Some(line.to_string()))
 }
 
+/// `path` with a leading `home` shown as `~`, for the settings footer (M10). The prefix
+/// must end where a path component does, so `/home/user2` is not `~2`.
+fn short_home_path(path: &Path, home: Option<&str>) -> String {
+    let text = path.display().to_string();
+    let Some(home) = home.filter(|h| !h.is_empty()) else {
+        return text;
+    };
+    match text.strip_prefix(home) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with(std::path::MAIN_SEPARATOR) => format!("~{rest}"),
+        _ => text,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::config::Key;
     use chrono::NaiveDate;
     use std::path::Path;
 
@@ -1801,16 +1977,21 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 9, 20).unwrap()
     }
 
-    /// Copy fixtures/vault into a temp dir so tests never mutate the checked-in files.
-    fn fixture_vault() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+    /// The top-level markdown of fixtures/vault, copied into `dest`.
+    fn copy_fixture_notes(dest: &Path) {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/vault");
         for entry in std::fs::read_dir(&src).unwrap() {
             let entry = entry.unwrap();
             if entry.file_type().unwrap().is_file() {
-                std::fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
+                std::fs::copy(entry.path(), dest.join(entry.file_name())).unwrap();
             }
         }
+    }
+
+    /// Copy fixtures/vault into a temp dir so tests never mutate the checked-in files.
+    fn fixture_vault() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        copy_fixture_notes(dir.path());
         dir
     }
 
@@ -3264,6 +3445,52 @@ mod tests {
     }
 
     #[test]
+    fn set_config_changes_the_collection_name() {
+        let (_d, mut app) = fixture_app();
+        assert_eq!(app.collection_name(), "all", "the default collection");
+        let mut c = Config::default();
+        c.set(Key::Collection, "citrus").unwrap();
+        app.set_config(c, None);
+        assert_eq!(app.collection_name(), "citrus");
+    }
+
+    /// The fixture app with `final_drill` set to `mode` through the config (M10).
+    fn app_with_final_drill(mode: &str) -> (tempfile::TempDir, App) {
+        let (dir, mut app) = fixture_app();
+        let mut config = Config::default();
+        config.set(Key::FinalDrill, mode).unwrap();
+        app.set_config(config, None);
+        (dir, app)
+    }
+
+    #[test]
+    fn final_drill_on_skips_the_prompt() {
+        let (_d, mut app) = app_with_final_drill("on");
+        walk_to_prompt(&mut app);
+        assert_eq!(app.review.phase, Phase::Drilling, "no prompt: the drill starts itself");
+        assert!(app.review.current.is_some(), "the first drill card is loaded");
+        assert!(app.review.status.is_none(), "the main-pass grade must not sit under a drill card");
+    }
+
+    #[test]
+    fn final_drill_off_finishes_without_a_drill() {
+        let (_d, mut app) = app_with_final_drill("off");
+        walk_to_prompt(&mut app);
+        assert_eq!(app.review.phase, Phase::Main);
+        assert!(app.review.current.is_none());
+        assert!(app.review.drill.is_empty(), "the failures are dropped, exactly as `n` does");
+        assert_eq!(app.finish_line(), "nothing more to learn · 4 graded · 2 read");
+    }
+
+    #[test]
+    fn final_drill_ask_is_unchanged() {
+        let (_d, mut app) = app_with_final_drill("ask");
+        walk_to_prompt(&mut app);
+        assert_eq!(app.review.phase, Phase::DrillPrompt);
+        assert_eq!(app.drill_prompt(), "final drill · 2 cards");
+    }
+
+    #[test]
     fn y_clears_the_last_real_grade_status_before_the_first_drill_card() {
         let (_d, mut app) = fixture_app();
         walk_to_prompt(&mut app);
@@ -4122,5 +4349,253 @@ mod tests {
 
         // Restore the write bit so the TempDir can delete the file.
         std::fs::set_permissions(&bergamot, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    // ---- settings screen (M10) ----
+
+    /// The fixture vault copied into `dir`, opened, and handed a config path at
+    /// `<dir>/config` whose file does not exist yet: the settings screen can edit and
+    /// save it, and the caller keeps `dir` alive for the assertions.
+    fn app_with_config(dir: &Path) -> App {
+        copy_fixture_notes(dir);
+        let mut app = App::open(dir, today()).unwrap();
+        app.set_config(Config::default(), Some(dir.join("config")));
+        app
+    }
+
+    /// What `app_with_config` wrote to, as text. Panics until an edit has saved it.
+    fn config_text(dir: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(dir.path().join("config")).unwrap()
+    }
+
+    fn backspace(app: &mut App, n: usize) {
+        for _ in 0..n {
+            app.handle_key(KeyCode::Backspace).unwrap();
+        }
+    }
+
+    /// The app opens on the session and `o` is a table key, so the settings screen is
+    /// two presses away.
+    fn open_settings_screen(app: &mut App) {
+        app.handle_key(KeyCode::Tab).unwrap();
+        press(app, 'o');
+        assert_eq!(app.screen, Screen::Settings);
+    }
+
+    #[test]
+    fn o_opens_settings_from_the_queue_and_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_config(dir.path());
+
+        // From the table: `o` opens, `esc` goes back and the selection survives.
+        app.handle_key(KeyCode::Tab).unwrap();
+        press(&mut app, 'j');
+        press(&mut app, 'o');
+        assert_eq!(app.screen, Screen::Settings);
+        assert_eq!(app.settings_context(), "settings");
+        assert_eq!(app.settings_sel(), 0, "the screen opens on the first row");
+        app.handle_key(KeyCode::Esc).unwrap();
+        assert_eq!(app.screen, Screen::Queue);
+        assert_eq!(app.queue_sel, 1, "the table selection survives the visit");
+
+        // `o` closes it again, and so does `tab`; both land back on the table.
+        press(&mut app, 'o');
+        press(&mut app, 'o');
+        assert_eq!(app.screen, Screen::Queue);
+        press(&mut app, 'o');
+        assert_eq!(app.screen, Screen::Settings);
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.screen, Screen::Queue, "tab closes the settings screen too");
+        assert_eq!(app.queue_sel, 1);
+
+        // Inert in the session: the review hints row has no room for another key.
+        let (_d2, mut app) = fixture_app();
+        assert_eq!(app.screen, Screen::Review);
+        let sm_id = app.review.current.as_ref().unwrap().item.sm_id;
+        press(&mut app, 'o');
+        assert_eq!(app.screen, Screen::Review, "o is not a review key");
+        assert_eq!(app.review.current.as_ref().unwrap().item.sm_id, sm_id);
+
+        // Inert on the read screen and inside both prompts.
+        open_article(&mut app, "citrus-vocab.md");
+        press(&mut app, 'o');
+        assert_eq!(app.screen, Screen::Read, "o is not a read-screen key");
+
+        app.handle_key(KeyCode::Tab).unwrap();
+        assert_eq!(app.screen, Screen::Queue);
+        press(&mut app, 'p');
+        press(&mut app, 'o');
+        assert_eq!(app.screen, Screen::Queue, "the priority prompt swallows o");
+        assert!(app.prompt_text().is_some());
+        app.handle_key(KeyCode::Esc).unwrap();
+
+        press(&mut app, 'a');
+        press(&mut app, 'o');
+        assert_eq!(app.screen, Screen::Queue);
+        assert_eq!(app.prompt_text().as_deref(), Some("add card · Q: o"), "o is typed, not a key");
+        app.handle_key(KeyCode::Esc).unwrap();
+
+        // Inert at the drill prompt and in the drill itself.
+        let (_d3, mut app) = fixture_app();
+        walk_to_prompt(&mut app);
+        assert_eq!(app.review.phase, Phase::DrillPrompt);
+        press(&mut app, 'o');
+        assert_eq!(app.screen, Screen::Review, "the drill prompt ignores o");
+        assert_eq!(app.review.phase, Phase::DrillPrompt);
+        press(&mut app, 'y');
+        assert_eq!(app.review.phase, Phase::Drilling);
+        press(&mut app, 'o');
+        assert_eq!(app.screen, Screen::Review, "the drill ignores o");
+        assert_eq!(app.review.phase, Phase::Drilling);
+    }
+
+    #[test]
+    fn j_and_k_clamp_over_four_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_config(dir.path());
+        open_settings_screen(&mut app);
+        assert_eq!(app.settings_sel(), 0);
+        press(&mut app, 'k');
+        assert_eq!(app.settings_sel(), 0, "k on the first row stays");
+        for expected in [1, 2, 3, 3, 3] {
+            press(&mut app, 'j');
+            assert_eq!(app.settings_sel(), expected, "j stops on the last row");
+        }
+        app.handle_key(KeyCode::Up).unwrap();
+        assert_eq!(app.settings_sel(), 2, "the arrows move too");
+        app.handle_key(KeyCode::Down).unwrap();
+        assert_eq!(app.settings_sel(), 3);
+    }
+
+    #[test]
+    fn enter_on_collection_prefills_and_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_config(dir.path());
+        assert!(!app.config_file_exists, "no file until an edit saves one");
+        open_settings_screen(&mut app);
+        for _ in 0..3 {
+            press(&mut app, 'j');
+        }
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.prompt_text().as_deref(), Some("collection: all"), "prefilled");
+        assert_eq!(app.text_prompt_stage(), Some(TextStage::Final));
+
+        backspace(&mut app, 3);
+        type_text(&mut app, "citrus");
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.prompt_text(), None, "the prompt closes on a valid value");
+        assert_eq!(app.screen, Screen::Settings, "the screen stays up");
+        assert_eq!(app.collection_name(), "citrus", "the status row changes at once");
+        assert!(config_text(&dir).contains("collection = citrus"), "{}", config_text(&dir));
+        assert!(app.config_file_exists, "the footer now names an existing file");
+    }
+
+    #[test]
+    fn enter_on_final_drill_cycles_and_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_config(dir.path());
+        open_settings_screen(&mut app);
+        press(&mut app, 'j');
+        press(&mut app, 'j');
+
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert!(app.prompt_text().is_none(), "the drill mode cycles without a prompt");
+        assert_eq!(app.config.final_drill, FinalDrill::On);
+        assert!(config_text(&dir).contains("final_drill = on"), "{}", config_text(&dir));
+
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.config.final_drill, FinalDrill::Off);
+        assert!(config_text(&dir).contains("final_drill = off"), "{}", config_text(&dir));
+
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.config.final_drill, FinalDrill::Ask);
+        assert!(config_text(&dir).contains("final_drill = ask"), "{}", config_text(&dir));
+    }
+
+    #[test]
+    fn bad_postpone_keeps_the_prompt_with_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_config(dir.path());
+        open_settings_screen(&mut app);
+        press(&mut app, 'j');
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.prompt_text().as_deref(), Some("postpone: 50"));
+
+        backspace(&mut app, 2);
+        type_text(&mut app, "abc");
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.prompt_text().as_deref(), Some("postpone: abc"), "the prompt stays open");
+        assert_eq!(app.notice.as_deref(), Some("config · postpone expects a count or off"));
+
+        app.handle_key(KeyCode::Esc).unwrap();
+        assert_eq!(app.prompt_text(), None);
+        assert_eq!(app.config.get(Key::Postpone), "50", "a refused value changes nothing");
+        assert!(!dir.path().join("config").exists(), "and nothing was saved");
+
+        app.handle_key(KeyCode::Enter).unwrap();
+        backspace(&mut app, 2);
+        type_text(&mut app, "off");
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.config.get(Key::Postpone), "off");
+        assert!(config_text(&dir).contains("postpone = off"), "{}", config_text(&dir));
+    }
+
+    #[test]
+    fn vault_edit_saves_raw_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_config(dir.path());
+        open_settings_screen(&mut app);
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.prompt_text().as_deref(), Some("vault: vault"));
+
+        backspace(&mut app, "vault".len());
+        type_text(&mut app, "~/notes");
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.config.get(Key::Vault), "~/notes", "stored as typed, expanded at launch");
+        assert!(config_text(&dir).contains("vault = ~/notes"), "{}", config_text(&dir));
+    }
+
+    #[test]
+    fn no_config_path_edits_apply_but_are_not_saved() {
+        let (_d, mut app) = fixture_app();
+        app.set_config(Config::default(), None);
+        open_settings_screen(&mut app);
+        for _ in 0..3 {
+            press(&mut app, 'j');
+        }
+        app.handle_key(KeyCode::Enter).unwrap();
+        backspace(&mut app, 3);
+        type_text(&mut app, "citrus");
+        app.handle_key(KeyCode::Enter).unwrap();
+        assert_eq!(app.prompt_text(), None, "the prompt still closes");
+        assert_eq!(app.collection_name(), "citrus", "the edit applies in memory");
+        assert_eq!(app.notice.as_deref(), Some("config · no home directory · not saved"));
+    }
+
+    #[test]
+    fn progress_bar_hidden_on_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_config(dir.path());
+        assert!(app.progress().is_some(), "the bar shows during the main pass");
+        open_settings_screen(&mut app);
+        assert!(app.progress().is_none(), "no bar over the settings screen");
+    }
+
+    #[test]
+    fn settings_footer_shortens_the_home_prefix() {
+        let path = Path::new("/home/u/.config/grain/config");
+        assert_eq!(short_home_path(path, Some("/home/u")), "~/.config/grain/config");
+        assert_eq!(short_home_path(path, None), "/home/u/.config/grain/config", "no HOME, no ~");
+        assert_eq!(
+            short_home_path(path, Some("/home/other")),
+            "/home/u/.config/grain/config",
+            "a path outside HOME is shown whole"
+        );
+        assert_eq!(
+            short_home_path(Path::new("/home/user2/c"), Some("/home/user")),
+            "/home/user2/c",
+            "the prefix must end at a separator"
+        );
+        assert_eq!(short_home_path(Path::new("/home/u"), Some("/home/u")), "~");
     }
 }
