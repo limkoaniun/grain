@@ -130,6 +130,13 @@ impl Document {
         self.set_after("interval", Value::from(interval), &["due", "sm_id", "type"]);
     }
 
+    /// Set `due` alone, leaving `interval` as it is: the M9 auto-postpone moves an
+    /// overdue item's date without claiming it was reviewed. Placement matches
+    /// [`Document::set_schedule`] — right after `sm_id` (or `type`) for a new key.
+    pub fn set_due(&mut self, due: NaiveDate) {
+        self.set_after("due", Value::from(due.to_string()), &["sm_id", "type"]);
+    }
+
     // The M2/M5 setters keep new keys in the documented order:
     // due, interval, prio, read_pos, a_factor, done, source, range, url, imported.
 
@@ -412,6 +419,49 @@ mod tests {
         doc.set_schedule(NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(), 1);
         let out = doc.serialize().unwrap();
         assert!(out.starts_with("---\ntype: card\ndue: 2026-10-02\ninterval: 1\nprio: 40\n---\n"), "{out}");
+    }
+
+    #[test]
+    fn set_due_alone_inserts_after_sm_id_and_leaves_interval() {
+        let mut doc =
+            Document::parse("---\ntype: card\nsm_id: 7\ninterval: 4\nprio: 30\ncustom: keep\n---\nQ: a?\n\nA: b\n")
+                .unwrap();
+        doc.set_due(NaiveDate::from_ymd_opt(2026, 9, 21).unwrap());
+        let out = doc.serialize().unwrap();
+        assert_eq!(
+            out,
+            "---\ntype: card\nsm_id: 7\ndue: 2026-09-21\ninterval: 4\nprio: 30\ncustom: keep\n---\nQ: a?\n\nA: b\n",
+            "{out}"
+        );
+        let again = Document::parse(&out).unwrap();
+        let keys: Vec<String> = again.front.keys().filter_map(|k| k.as_str().map(str::to_string)).collect();
+        assert_eq!(keys, ["type", "sm_id", "due", "interval", "prio", "custom"]);
+        let meta = again.meta().unwrap();
+        assert_eq!(meta.due, NaiveDate::from_ymd_opt(2026, 9, 21));
+        assert_eq!(meta.interval, Some(4), "interval is never rewritten");
+
+        // An existing `due` is replaced in place; `interval` is untouched.
+        let mut doc =
+            Document::parse("---\ntype: card\nsm_id: 7\ndue: 2026-09-01\ninterval: 4\n---\nQ: a?\n\nA: b\n").unwrap();
+        doc.set_due(NaiveDate::from_ymd_opt(2026, 9, 21).unwrap());
+        let out = doc.serialize().unwrap();
+        assert_eq!(
+            out,
+            "---\ntype: card\nsm_id: 7\ndue: 2026-09-21\ninterval: 4\n---\nQ: a?\n\nA: b\n",
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn set_due_without_sm_id_inserts_after_type() {
+        let mut doc = Document::parse("---\ntype: card\ninterval: 4\nprio: 30\n---\nQ: a?\n\nA: b\n").unwrap();
+        doc.set_due(NaiveDate::from_ymd_opt(2026, 9, 21).unwrap());
+        let out = doc.serialize().unwrap();
+        assert!(
+            out.starts_with("---\ntype: card\ndue: 2026-09-21\ninterval: 4\nprio: 30\n---\n"),
+            "{out}"
+        );
+        assert_eq!(Document::parse(&out).unwrap().meta().unwrap().interval, Some(4));
     }
 
     #[test]

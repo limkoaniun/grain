@@ -1029,7 +1029,8 @@ mod tests {
             }
             let today = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
             let fake = crate::sync::api::FakeScheduler::always_ok();
-            let app = App::open_with_scheduler(dir.path(), today, Box::new(fake)).unwrap();
+            let postpone = crate::postpone::Postpone::Off;
+            let app = App::open_with_scheduler(dir.path(), today, postpone, Box::new(fake)).unwrap();
             (dir, app)
         };
         // Start at kumquat: a card follows it, so the review screen is still up after the grade.

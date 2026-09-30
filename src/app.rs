@@ -28,9 +28,10 @@ use crate::sync::{
 };
 use crate::vault::frontmatter::ItemType;
 use crate::vault::index::{
-    create_child, create_item, load_card, refresh, write_article_session, write_done, write_prio,
-    write_read_pos, write_schedule, LoadedCard, NewItem, RefreshReport,
+    create_child, create_item, load_card, refresh, write_article_session, write_done, write_due,
+    write_prio, write_read_pos, write_schedule, LoadedCard, NewItem, RefreshReport,
 };
+use crate::postpone::{self, Postpone};
 use crate::import::{fetch_title_body, html_to_markdown, Fetcher, UreqFetcher};
 use crate::stats::{self, local_date, Stats};
 
@@ -323,12 +324,68 @@ struct PendingImport {
     armed: bool,
 }
 
+/// What a startup postpone did: how many items moved, how many stayed due, and one
+/// `sync_log` line per file that could not be written.
+#[derive(Debug, Default)]
+struct PostponeOutcome {
+    moved: usize,
+    kept: usize,
+    failures: Vec<String>,
+}
+
+/// Push the overdue backlog out past the top `keep` items (M9), before the `App` exists.
+///
+/// The dates live in the files, so a rebuilt `.grain` still reproduces the same queue: every
+/// successful write records the file's new mtime in the same row, so the next refresh skips
+/// it. A file that cannot be written is reported and left alone, index row included; a row
+/// that cannot be updated after its file was written is a hard error, like every other
+/// index write.
+fn run_postpone(
+    root: &Path,
+    db: &Db,
+    today: NaiveDate,
+    postpone: Postpone,
+) -> Result<PostponeOutcome> {
+    if postpone == Postpone::Off {
+        return Ok(PostponeOutcome::default());
+    }
+    let overdue = db.overdue_items(today)?;
+    let plan = postpone::plan(&overdue, today, postpone);
+    let mut outcome = PostponeOutcome {
+        moved: 0,
+        kept: plan.kept,
+        failures: Vec::new(),
+    };
+    for m in &plan.moves {
+        match write_due(root, &m.path, m.due) {
+            Ok(mtime) => {
+                db.set_due(m.sm_id, m.due, mtime)?;
+                outcome.moved += 1;
+            }
+            Err(e) => outcome.failures.push(format!("postpone: {}: {e:#}", m.path)),
+        }
+    }
+    Ok(outcome)
+}
+
 impl App {
+    /// [`App::open_with`] with the postpone off, so the fixture dates stay put (tests).
+    #[cfg(test)]
+    pub fn open(root: &Path, today: NaiveDate) -> Result<Self> {
+        Self::open_with(root, today, Postpone::Off)
+    }
+
     /// Open the vault, refresh the index and build the queue and learn session, landing
     /// on the first due item. Offline.
-    pub fn open(root: &Path, today: NaiveDate) -> Result<Self> {
+    ///
+    /// `postpone` decides how much of the overdue backlog is pushed out (M9); it happens
+    /// before the queue and the session are read, so both see the new dates.
+    pub fn open_with(root: &Path, today: NaiveDate, postpone: Postpone) -> Result<Self> {
         let db = Db::open(&root.join(".grain").join("grain.db"))?;
         let refresh = refresh(root, &db).context("refreshing index")?;
+        // After the refresh, so every file has a row; before `queue` and `due_items`, so the
+        // table and the session are built from the postponed dates.
+        let outcome = run_postpone(root, &db, today, postpone)?;
         // After the refresh: a file the index just created is a file an embed may name.
         let media_index = MediaIndex::from_vault(root).context("indexing vault media")?;
         let items = db.queue()?;
@@ -364,14 +421,23 @@ impl App {
             media_index,
             last_played_target: None,
         };
+        if outcome.moved > 0 {
+            app.notice = Some(format!("postponed {} · kept {}", outcome.moved, outcome.kept));
+        }
+        app.sync_log.extend(outcome.failures);
         app.load_current()?;
         Ok(app)
     }
 
-    /// Like [`App::open`], then start syncing grades through `scheduler`: the outbox is
+    /// Like [`App::open_with`], then start syncing grades through `scheduler`: the outbox is
     /// loaded with every unsynced journal row and the worker thread is spawned.
-    pub fn open_with_scheduler(root: &Path, today: NaiveDate, scheduler: Box<dyn Scheduler>) -> Result<Self> {
-        let mut app = Self::open(root, today)?;
+    pub fn open_with_scheduler(
+        root: &Path,
+        today: NaiveDate,
+        postpone: Postpone,
+        scheduler: Box<dyn Scheduler>,
+    ) -> Result<Self> {
+        let mut app = Self::open_with(root, today, postpone)?;
         app.enable_sync(scheduler)?;
         Ok(app)
     }
@@ -1736,7 +1802,7 @@ mod tests {
     }
 
     /// Copy fixtures/vault into a temp dir so tests never mutate the checked-in files.
-    fn fixture_app() -> (tempfile::TempDir, App) {
+    fn fixture_vault() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/vault");
         for entry in std::fs::read_dir(&src).unwrap() {
@@ -1745,7 +1811,20 @@ mod tests {
                 std::fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
             }
         }
+        dir
+    }
+
+    /// A copy of fixtures/vault opened with the postpone off, as every pre-M9 test expects.
+    fn fixture_app() -> (tempfile::TempDir, App) {
+        let dir = fixture_vault();
         let app = App::open(dir.path(), today()).unwrap();
+        (dir, app)
+    }
+
+    /// Like [`fixture_app`], but with the postpone `main` would pass (M9).
+    fn fixture_app_with(p: Postpone) -> (tempfile::TempDir, App) {
+        let dir = fixture_vault();
+        let app = App::open_with(dir.path(), today(), p).unwrap();
         (dir, app)
     }
 
@@ -1921,7 +2000,7 @@ mod tests {
                 db.set_meta(k, v).unwrap();
             }
         }
-        let app = App::open_with_scheduler(dir.path(), today(), Box::new(fake)).unwrap();
+        let app = App::open_with_scheduler(dir.path(), today(), Postpone::Off, Box::new(fake)).unwrap();
         (dir, app)
     }
 
@@ -2130,7 +2209,7 @@ mod tests {
         drop(db);
         let fake = FakeScheduler::always_ok();
         let seen = fake.seen.clone();
-        let mut app = App::open_with_scheduler(dir.path(), today(), Box::new(fake)).unwrap();
+        let mut app = App::open_with_scheduler(dir.path(), today(), Postpone::Off, Box::new(fake)).unwrap();
         assert_eq!(app.queue_context(), "queue · sort prio · 2 unsynced");
         let start = Instant::now();
         while !app.db.pending_grades().unwrap().is_empty() {
@@ -3735,7 +3814,7 @@ mod tests {
     fn synced_media_app(files: &[(&str, &str)]) -> (tempfile::TempDir, App, Arc<Mutex<AudioLog>>) {
         let dir = media_vault(files);
         let mut app =
-            App::open_with_scheduler(dir.path(), today(), Box::new(FakeScheduler::always_ok()))
+            App::open_with_scheduler(dir.path(), today(), Postpone::Off, Box::new(FakeScheduler::always_ok()))
                 .unwrap();
         app.set_picker(test_picker());
         let (audio, log) = NullAudio::new();
@@ -3897,5 +3976,151 @@ mod tests {
             }
             other => panic!("expected audio, got {other:?}"),
         }
+    }
+
+    // ---- M9: auto-postpone at startup ----------------------------------------------
+
+    #[test]
+    fn keep_one_postpones_bergamot_and_builds_the_session_after() {
+        let (dir, app) = fixture_app_with(Postpone::Keep(1));
+
+        // bergamot (prio 60) is the lowest-priority overdue item, so it is the one that moves;
+        // interval 1 gives a one-day delay, and neither `interval` nor `prio` is rewritten.
+        let bergamot = file(&dir, "bergamot.md");
+        assert!(bergamot.contains("due: 2026-09-21"), "{bergamot}");
+        assert!(bergamot.contains("interval: 1"), "{bergamot}");
+        assert!(bergamot.contains("prio: 60"), "{bergamot}");
+        // kumquat (prio 35) keeps the one slot and its file is untouched.
+        assert!(file(&dir, "kumquat.md").contains("due: 2026-09-10"));
+
+        assert_eq!(app.notice.as_deref(), Some("postponed 1 · kept 1"));
+
+        // The session is built after the postpone, so the moved card is not in it.
+        assert_eq!(app.review.due.len(), 5, "{:?}", app.review.due);
+        let path_of = |sm_id: i64| {
+            app.items
+                .iter()
+                .find(|i| i.sm_id == sm_id)
+                .map(|i| i.path.clone())
+                .unwrap()
+        };
+        assert!(
+            app.review.due.iter().all(|&id| path_of(id) != "bergamot.md"),
+            "bergamot is no longer due"
+        );
+
+        let row = app.items.iter().find(|i| i.path == "bergamot.md").unwrap();
+        assert_eq!(row.due, Some(NaiveDate::from_ymd_opt(2026, 9, 21).unwrap()));
+        assert_eq!(row.interval, Some(1), "the interval is never rewritten");
+
+        let left: Vec<String> = app
+            .db
+            .overdue_items(today())
+            .unwrap()
+            .into_iter()
+            .map(|i| i.path)
+            .collect();
+        assert_eq!(left, vec!["kumquat.md".to_string()]);
+    }
+
+    #[test]
+    fn second_open_the_same_day_writes_nothing() {
+        let (dir, app) = fixture_app_with(Postpone::Keep(1));
+        let before = file(&dir, "bergamot.md");
+        let before_mtime = std::fs::metadata(dir.path().join("bergamot.md")).unwrap().modified().unwrap();
+        drop(app);
+
+        let app = App::open_with(dir.path(), today(), Postpone::Keep(1)).unwrap();
+
+        assert_eq!(file(&dir, "bergamot.md"), before, "nothing left to postpone");
+        assert_eq!(
+            std::fs::metadata(dir.path().join("bergamot.md")).unwrap().modified().unwrap(),
+            before_mtime
+        );
+        assert_eq!(app.notice, None, "no notice when nothing moved");
+        assert_eq!(app.review.due.len(), 5);
+    }
+
+    #[test]
+    fn keep_zero_postpones_both() {
+        let (dir, app) = fixture_app_with(Postpone::Keep(0));
+
+        // kumquat's interval is 3, bergamot's 1; a tenth of either rounds to one day.
+        assert!(file(&dir, "bergamot.md").contains("due: 2026-09-21"));
+        assert!(file(&dir, "kumquat.md").contains("due: 2026-09-21"));
+        assert_eq!(app.notice.as_deref(), Some("postponed 2 · kept 0"));
+        assert_eq!(app.review.due.len(), 4, "{:?}", app.review.due);
+    }
+
+    #[test]
+    fn open_is_postpone_off() {
+        let (dir, app) = fixture_app();
+
+        // bergamot carries no `sm_id` in the fixture, so the refresh allocates one and writes
+        // it back; apart from that line neither overdue file may change without a postpone.
+        let without_sm_id = |text: &str| -> String {
+            text.lines()
+                .filter(|l| !l.starts_with("sm_id:"))
+                .map(|l| format!("{l}\n"))
+                .collect()
+        };
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/vault");
+        for name in ["bergamot.md", "kumquat.md"] {
+            let original = std::fs::read_to_string(src.join(name)).unwrap();
+            assert_eq!(without_sm_id(&file(&dir, name)), without_sm_id(&original), "{name} changed");
+        }
+
+        assert_eq!(app.notice, None);
+        assert_eq!(app.review.due.len(), 6, "{:?}", app.review.due);
+    }
+
+    #[test]
+    fn protected_article_is_never_postponed() {
+        let dir = fixture_vault();
+        std::fs::write(
+            dir.path().join("guard.md"),
+            "---\ntype: article\ndue: 2026-09-01\ninterval: 7\nprio: 1\na_factor: 1.01\n---\n# g\n",
+        )
+        .unwrap();
+
+        let app = App::open_with(dir.path(), today(), Postpone::Keep(0)).unwrap();
+
+        assert!(file(&dir, "guard.md").contains("due: 2026-09-01"), "a_factor 1.01 is protected");
+        assert_eq!(app.notice.as_deref(), Some("postponed 2 · kept 0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_file_lands_in_sync_log_and_the_app_opens() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = fixture_vault();
+        let bergamot = dir.path().join("bergamot.md");
+        // With an `sm_id` of its own the refresh writes nothing, so only the postpone fails.
+        std::fs::write(
+            &bergamot,
+            "---\ntype: card\nsm_id: 1099\ndue: 2026-09-01\ninterval: 1\nprio: 60\n---\nQ: bergamot?\n\nA: bergamot\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bergamot, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let app = App::open_with(dir.path(), today(), Postpone::Keep(0)).unwrap();
+
+        assert_eq!(app.sync_log.len(), 1, "{:?}", app.sync_log);
+        assert!(
+            app.sync_log[0].starts_with("postpone: bergamot.md:"),
+            "{:?}",
+            app.sync_log
+        );
+        assert_eq!(app.notice.as_deref(), Some("postponed 1 · kept 0"), "kumquat still moved");
+        assert!(file(&dir, "kumquat.md").contains("due: 2026-09-21"));
+        assert_eq!(
+            app.db.item(1099).unwrap().unwrap().due,
+            Some(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap()),
+            "a failed file write leaves the row alone"
+        );
+
+        // Restore the write bit so the TempDir can delete the file.
+        std::fs::set_permissions(&bergamot, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 }

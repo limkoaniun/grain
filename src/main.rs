@@ -7,6 +7,7 @@ mod app;
 mod db;
 mod import;
 mod media;
+mod postpone;
 mod stats;
 mod sync;
 mod ui;
@@ -21,21 +22,25 @@ use ratatui::DefaultTerminal;
 use ratatui_image::picker::Picker;
 
 use crate::app::App;
+use crate::postpone::{Postpone, DEFAULT_KEEP};
 use crate::sync::api::{Scheduler, UreqScheduler, API_KEY_ENV};
 
-const USAGE: &str = "usage: grain [--vault <path>] [--auth-check]\n\n  --vault <path>   vault directory (default ./vault)\n  --auth-check     check GRAIN_SM_API_KEY against the SuperMemo API and exit\n  -h, --help       show this help";
+const USAGE: &str = "usage: grain [--vault <path>] [--auth-check]\n\n  --vault <path>   vault directory (default ./vault)\n  --postpone <N|off>  keep the N top-priority overdue items and postpone the rest (default 50)\n  --auth-check     check GRAIN_SM_API_KEY against the SuperMemo API and exit\n  -h, --help       show this help";
 
 /// How long the event loop waits for a key before running `App::tick`.
 const TICK: Duration = Duration::from_millis(100);
 
+#[derive(Debug)]
 struct Args {
     vault: PathBuf,
     auth_check: bool,
+    postpone: Postpone,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>> {
     let mut vault = PathBuf::from("vault");
     let mut auth_check = false;
+    let mut postpone = Postpone::Keep(DEFAULT_KEEP);
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -45,15 +50,31 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>> {
                     .map(PathBuf::from)
                     .context("--vault needs a path")?;
             }
+            "--postpone" => {
+                postpone = parse_postpone(it.next().context("--postpone needs <N|off>")?.as_str())?;
+            }
             "--auth-check" => auth_check = true,
             "-h" | "--help" => return Ok(None),
             other if other.starts_with("--vault=") => {
                 vault = PathBuf::from(&other["--vault=".len()..]);
             }
+            other if other.starts_with("--postpone=") => {
+                postpone = parse_postpone(&other["--postpone=".len()..])?;
+            }
             other => bail!("unknown argument `{other}`\n{USAGE}"),
         }
     }
-    Ok(Some(Args { vault, auth_check }))
+    Ok(Some(Args { vault, auth_check, postpone }))
+}
+
+/// `"off"` or a non-negative count for `--postpone`.
+fn parse_postpone(s: &str) -> Result<Postpone> {
+    if s == "off" {
+        return Ok(Postpone::Off);
+    }
+    s.parse::<usize>()
+        .map(Postpone::Keep)
+        .with_context(|| format!("--postpone expects a count or `off`, got `{s}`\n{USAGE}"))
 }
 
 /// The API key from the environment, or `None` for offline mode.
@@ -77,8 +98,13 @@ fn main() -> Result<()> {
     }
     let today = chrono::Local::now().date_naive();
     let mut app = match api_key() {
-        Some(key) => App::open_with_scheduler(&args.vault, today, Box::new(UreqScheduler::new(&key))),
-        None => App::open(&args.vault, today),
+        Some(key) => App::open_with_scheduler(
+            &args.vault,
+            today,
+            args.postpone,
+            Box::new(UreqScheduler::new(&key)),
+        ),
+        None => App::open_with(&args.vault, today, args.postpone),
     }
     .with_context(|| format!("opening vault {}", args.vault.display()))?;
     for (path, reason) in &app.refresh.skipped {
@@ -189,6 +215,39 @@ mod tests {
         let args = parse(&["--auth-check", "--vault", "v"]).unwrap().unwrap();
         assert!(args.auth_check);
         assert_eq!(args.vault, PathBuf::from("v"));
+    }
+
+    #[test]
+    fn postpone_flag_default_count_and_off() {
+        assert_eq!(parse(&[]).unwrap().unwrap().postpone, Postpone::Keep(50));
+        assert_eq!(
+            parse(&["--postpone", "20"]).unwrap().unwrap().postpone,
+            Postpone::Keep(20)
+        );
+        assert_eq!(
+            parse(&["--postpone", "0"]).unwrap().unwrap().postpone,
+            Postpone::Keep(0)
+        );
+        assert_eq!(
+            parse(&["--postpone", "off"]).unwrap().unwrap().postpone,
+            Postpone::Off
+        );
+        assert_eq!(
+            parse(&["--postpone=off"]).unwrap().unwrap().postpone,
+            Postpone::Off
+        );
+        assert_eq!(
+            parse(&["--postpone=7"]).unwrap().unwrap().postpone,
+            Postpone::Keep(7)
+        );
+    }
+
+    #[test]
+    fn postpone_flag_rejects_bad_values() {
+        assert!(parse(&["--postpone"]).is_err());
+        let err = parse(&["--postpone", "x"]).unwrap_err();
+        assert!(err.to_string().contains("--postpone"));
+        assert!(parse(&["--postpone", "-1"]).is_err());
     }
 
     #[test]
