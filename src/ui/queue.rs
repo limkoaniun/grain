@@ -12,12 +12,14 @@ use crate::app::App;
 use crate::db::ItemRow;
 use crate::vault::frontmatter::ItemType;
 
+/// `j`/`k` move the selection but are not listed: the row is exactly 80 cells wide, the
+/// width grain renders at, and every key on it had to earn its place.
 pub const HINTS: &[(&str, &str)] = &[
-    ("j/k", "move"),
     ("enter", "open"),
     ("a", "add"),
     ("i", "import"),
     ("s", "stats"),
+    ("o", "config"),
     ("p", "prio"),
     ("tab", "learn"),
     ("q", "quit"),

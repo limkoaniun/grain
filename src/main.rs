@@ -4,6 +4,7 @@
 //! synced to the SuperMemo API from a worker thread; without it grain is fully offline.
 
 mod app;
+mod config;
 mod db;
 mod import;
 mod media;
@@ -22,10 +23,11 @@ use ratatui::DefaultTerminal;
 use ratatui_image::picker::Picker;
 
 use crate::app::App;
-use crate::postpone::{Postpone, DEFAULT_KEEP};
+use crate::config::Config;
+use crate::postpone::Postpone;
 use crate::sync::api::{Scheduler, UreqScheduler, API_KEY_ENV};
 
-const USAGE: &str = "usage: grain [--vault <path>] [--auth-check]\n\n  --vault <path>   vault directory (default ./vault)\n  --postpone <N|off>  keep the N top-priority overdue items and postpone the rest (default 50)\n  --auth-check     check GRAIN_SM_API_KEY against the SuperMemo API and exit\n  -h, --help       show this help";
+const USAGE: &str = "usage: grain [--vault <path>] [--auth-check]\n\n  --vault <path>   vault directory (default: from config, else ./vault)\n  --postpone <N|off>  keep the N top-priority overdue items and postpone the rest (default: from config, else 50)\n  --auth-check     check GRAIN_SM_API_KEY against the SuperMemo API and exit\n  -h, --help       show this help";
 
 /// How long the event loop waits for a key before running `App::tick`.
 const TICK: Duration = Duration::from_millis(100);
@@ -37,10 +39,10 @@ struct Args {
     postpone: Postpone,
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>> {
-    let mut vault = PathBuf::from("vault");
+fn parse_args(args: impl IntoIterator<Item = String>, config: &Config) -> Result<Option<Args>> {
+    let mut vault = config.vault_path();
     let mut auth_check = false;
-    let mut postpone = Postpone::Keep(DEFAULT_KEEP);
+    let mut postpone = config.postpone;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -86,7 +88,12 @@ fn api_key() -> Option<String> {
 }
 
 fn main() -> Result<()> {
-    let Some(args) = parse_args(std::env::args().skip(1))? else {
+    let config_path = config::path();
+    let config = match &config_path {
+        Some(p) => Config::load(p)?,
+        None => Config::default(),
+    };
+    let Some(args) = parse_args(std::env::args().skip(1), &config)? else {
         println!("{USAGE}");
         return Ok(());
     };
@@ -107,6 +114,7 @@ fn main() -> Result<()> {
         None => App::open_with(&args.vault, today, args.postpone),
     }
     .with_context(|| format!("opening vault {}", args.vault.display()))?;
+    app.set_config(config, config_path);
     for (path, reason) in &app.refresh.skipped {
         eprintln!("grain: skipped {path}: {reason}");
     }
@@ -194,7 +202,11 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Option<Args>> {
-        parse_args(args.iter().map(|s| s.to_string()))
+        parse_with(args, &Config::default())
+    }
+
+    fn parse_with(args: &[&str], config: &Config) -> Result<Option<Args>> {
+        parse_args(args.iter().map(|s| s.to_string()), config)
     }
 
     #[test]
@@ -202,6 +214,29 @@ mod tests {
         let args = parse(&[]).unwrap().unwrap();
         assert_eq!(args.vault, PathBuf::from("vault"));
         assert!(!args.auth_check);
+    }
+
+    #[test]
+    fn defaults_come_from_the_config() {
+        let mut config = Config::default();
+        config.set(config::Key::Vault, "~/notes").unwrap();
+        config.set(config::Key::Postpone, "off").unwrap();
+        let args = parse_with(&[], &config).unwrap().unwrap();
+        assert_eq!(args.vault, config.vault_path());
+        assert_eq!(args.postpone, Postpone::Off);
+        assert_eq!(
+            parse_with(&["--postpone", "10"], &config).unwrap().unwrap().postpone,
+            Postpone::Keep(10)
+        );
+        assert_eq!(
+            parse_with(&["--vault", "x"], &config).unwrap().unwrap().vault,
+            PathBuf::from("x")
+        );
+    }
+
+    #[test]
+    fn usage_mentions_the_config() {
+        assert!(USAGE.contains("from config"));
     }
 
     #[test]
